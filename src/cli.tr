@@ -106,7 +106,7 @@ pub def parse_args(argv: Vec[str]) -> CliArgs:
 
 pub def print_usage():
     print("""
-taupkg -- Tauraro package manager v0.1.0
+taupkg -- Tauraro package manager v0.0.1
 
 Usage:
   taupkg <command> [options]
