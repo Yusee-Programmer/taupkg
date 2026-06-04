@@ -1,11 +1,6 @@
 # Manifest — reads and represents a taupkg.toml file.
-#
-# Manifest fields:
-#   name, version, desc, license, bin, authors
-#   deps: Map[str, str]   (name → version constraint)
-#   build_deps: Map[str, str]
-#   sources: Map[str, str] (name → source URI, overrides registry lookup)
 
+from std.io import File
 from toml import toml_load, TomlDoc, TomlSection
 
 class Manifest:
@@ -36,42 +31,30 @@ extend Manifest:
     pub def is_valid(self) -> bool:
         return self.name.len() > 0 and self.version.len() > 0
 
-    # Load a manifest from the given taupkg.toml path.
     pub def load(path: str) -> Manifest:
         mut m = Manifest.init()
         mut doc = toml_load(path)
-
         mut pkg = doc.get_section("package")
-        m.name    = pkg.keys.get("name")    if pkg.keys.contains("name")    else ""
-        m.version = pkg.keys.get("version") if pkg.keys.contains("version") else ""
-        m.desc    = pkg.keys.get("desc")    if pkg.keys.contains("desc")    else ""
-        m.license = pkg.keys.get("license") if pkg.keys.contains("license") else "MIT"
-        m.bin     = pkg.keys.get("bin")     if pkg.keys.contains("bin")     else ""
 
-        # authors = ["Name <email>"]  — stored as a single CSV string in TOML value,
-        # or as a raw bracket-list we just keep verbatim for display.
+        if pkg.keys.contains("name"):    m.name    = pkg.keys.get("name")
+        if pkg.keys.contains("version"): m.version = pkg.keys.get("version")
+        if pkg.keys.contains("desc"):    m.desc    = pkg.keys.get("desc")
+        if pkg.keys.contains("bin"):     m.bin     = pkg.keys.get("bin")
+        if pkg.keys.contains("license"):
+            m.license = pkg.keys.get("license")
         if pkg.keys.contains("authors"):
             m.authors.push(pkg.keys.get("authors"))
 
-        mut deps_sec = doc.get_section("deps")
-        mut i = 0
-        # We iterate over the raw keys map via known dep names stored as sections.
-        # Since Map has no iterator, callers must enumerate deps via get_array("deps")
-        # which taupkg.toml authors never write as [[deps]]; instead deps is a flat
-        # [deps] section — so we re-parse the raw TOML for deps ourselves:
-        m.deps = deps_sec.keys
-
-        mut bdeps_sec = doc.get_section("build-deps")
-        m.build_deps = bdeps_sec.keys
-
-        mut src_sec = doc.get_section("sources")
-        m.sources = src_sec.keys
+        mut deps_sec   = doc.get_section("deps")
+        mut bdeps_sec  = doc.get_section("build-deps")
+        mut src_sec    = doc.get_section("sources")
+        m.deps         = deps_sec.keys
+        m.build_deps   = bdeps_sec.keys
+        m.sources      = src_sec.keys
 
         return m
 
 
-# Return the path to taupkg.toml starting from the given directory,
-# searching upward until found or root is reached.
 def find_manifest(start_dir: str) -> str:
     mut dir = start_dir
     mut limit = 16
@@ -79,13 +62,10 @@ def find_manifest(start_dir: str) -> str:
         mut candidate = dir + "/taupkg.toml"
         if File.file_exists(candidate):
             return candidate
-        # Walk up one directory
-        mut sep = "/"
         mut pos = dir.len() - 1
-        # Find last slash
         while pos > 0:
             mut c = dir.char_at(pos)
-            if c == 47 or c == 92:  # '/' or '\'
+            if c == 47 or c == 92:
                 break
             pos = pos - 1
         if pos <= 0:

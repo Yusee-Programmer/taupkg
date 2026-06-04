@@ -7,8 +7,10 @@ def assert_eq(got: str, want: str, label: str):
         print("ok   " + label)
 
 def assert_bool(got: bool, want: bool, label: str):
-    mut gs = "true" if got else "false"
-    mut ws = "true" if want else "false"
+    mut gs = "false"
+    if got:  gs = "true"
+    mut ws = "false"
+    if want: ws = "true"
     if got != want:
         print("FAIL " + label + ": got=" + gs + " want=" + ws)
     else:

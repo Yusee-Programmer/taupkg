@@ -1,14 +1,11 @@
 # Lock file — taupkg.lock
 #
-# Format (custom, line-oriented):
-#   # taupkg lock file — do not edit manually
+# Format:
 #   [pkg]
-#   name    = "pkgname"
-#   version = "1.2.3"
-#   source  = "github:user/repo@v1.2.3"
+#   name     = "pkgname"
+#   version  = "1.2.3"
+#   source   = "github:user/repo@v1.2.3"
 #   checksum = "sha256:abcdef..."
-#
-# One [pkg] block per resolved dependency (including transitive deps).
 
 from std.io import File
 from toml import toml_load, TomlDoc
@@ -29,12 +26,13 @@ extend LockedPkg:
         return p
 
 
-class LockFile:
+# Renamed from LockFile to avoid clash with Windows API LockFile() function.
+class Lockfile:
     pub packages: Vec[LockedPkg]
 
-extend LockFile:
-    pub def init() -> LockFile:
-        mut lf = LockFile()
+extend Lockfile:
+    pub def init() -> Lockfile:
+        mut lf = Lockfile()
         lf.packages = Vec[LockedPkg].init(8)
         return lf
 
@@ -60,7 +58,6 @@ extend LockFile:
             i = i + 1
         self.packages.push(pkg)
 
-    # Serialize to taupkg.lock content string.
     pub def to_string(self) -> str:
         mut out = "# taupkg lock file — do not edit manually\n\n"
         mut i = 0
@@ -75,13 +72,11 @@ extend LockFile:
             i = i + 1
         return out
 
-    # Write taupkg.lock to the given path.
     pub def save(self, path: str):
         File.write_text(path, self.to_string())
 
-    # Load taupkg.lock from the given path.
-    pub def load(path: str) -> LockFile:
-        mut lf = LockFile.init()
+    pub def load(path: str) -> Lockfile:
+        mut lf = Lockfile.init()
         if not File.file_exists(path):
             return lf
         mut doc = toml_load(path)
@@ -89,10 +84,14 @@ extend LockFile:
         mut i = 0
         while i < pkgs.len:
             mut sec = pkgs.get(i)
-            mut name     = sec.keys.get("name")     if sec.keys.contains("name")     else ""
-            mut version  = sec.keys.get("version")  if sec.keys.contains("version")  else ""
-            mut source   = sec.keys.get("source")   if sec.keys.contains("source")   else ""
-            mut checksum = sec.keys.get("checksum") if sec.keys.contains("checksum") else ""
+            mut name     = ""
+            mut version  = ""
+            mut source   = ""
+            mut checksum = ""
+            if sec.keys.contains("name"):     name     = sec.keys.get("name")
+            if sec.keys.contains("version"):  version  = sec.keys.get("version")
+            if sec.keys.contains("source"):   source   = sec.keys.get("source")
+            if sec.keys.contains("checksum"): checksum = sec.keys.get("checksum")
             if name.len() > 0:
                 lf.packages.push(LockedPkg.init(name, version, source, checksum))
             i = i + 1

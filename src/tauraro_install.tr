@@ -74,7 +74,8 @@ def fetch_latest_version() -> str:
 # curl ships on Windows 10+, macOS, and all major Linux distros.
 # -f = fail on HTTP error  -S = show errors  -L = follow redirects
 def curl_download(url: str, dest: str, verbose: bool) -> int:
-    mut silence = if verbose: "" else: "-s "
+    mut silence = "-s "
+    if verbose: silence = ""
     mut cmd = "curl " + silence + "-fSL -o \"" + dest + "\" \"" + url + "\""
     return Process.system(cmd)
 

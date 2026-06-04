@@ -5,7 +5,7 @@ from std.io import File
 from std.os import OS, Process, Env
 from cli import parse_args, print_usage, CliArgs
 from manifest import Manifest, find_manifest
-from lockfile import LockFile, LockedPkg
+from lockfile import Lockfile, LockedPkg
 from semver import Version
 from source import parse_source
 from installer import install_package
@@ -53,7 +53,7 @@ def main(argv: Vec[str]) -> int:
         return 1
 
     mut lock_path = path_join(project_root, "taupkg.lock")
-    mut lockfile  = LockFile.load(lock_path)
+    mut lockfile  = Lockfile.load(lock_path)
 
     if args.command == "install":
         return cmd_install(manifest, lockfile, lock_path, project_root, verbose)
@@ -139,7 +139,7 @@ def cmd_init(args: CliArgs) -> int:
 
 # ── install ────────────────────────────────────────────────────────────────────
 
-def cmd_install(manifest: Manifest, lockfile: LockFile, lock_path: str, project_root: str, verbose: bool) -> int:
+def cmd_install(manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
     mut changed = false
     mut failed = false
 
@@ -153,8 +153,12 @@ def cmd_install(manifest: Manifest, lockfile: LockFile, lock_path: str, project_
     mut i = 0
     while i < dep_names.len:
         mut dep_name = dep_names.get(i)
-        mut constraint = manifest.deps.get(dep_name) if manifest.deps.contains(dep_name) else "*"
-        mut source_uri = manifest.sources.get(dep_name) if manifest.sources.contains(dep_name) else constraint
+        mut constraint = "*"
+        if manifest.deps.contains(dep_name):
+            constraint = manifest.deps.get(dep_name)
+        mut source_uri = constraint
+        if manifest.sources.contains(dep_name):
+            source_uri = manifest.sources.get(dep_name)
 
         # Check lockfile — use locked version if it satisfies constraint
         if lockfile.has(dep_name):
@@ -197,7 +201,7 @@ def cmd_install(manifest: Manifest, lockfile: LockFile, lock_path: str, project_
 
 # ── add ────────────────────────────────────────────────────────────────────────
 
-def cmd_add(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: LockFile, lock_path: str, project_root: str, verbose: bool) -> int:
+def cmd_add(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
     mut spec = args.first_pos()
     if spec.len() == 0:
         print("Usage: taupkg add <package>[@constraint]")
@@ -237,7 +241,7 @@ def cmd_add(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: Loc
 
 # ── remove ─────────────────────────────────────────────────────────────────────
 
-def cmd_remove(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: LockFile, lock_path: str, project_root: str) -> int:
+def cmd_remove(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: Lockfile, lock_path: str, project_root: str) -> int:
     mut dep_name = args.first_pos()
     if dep_name.len() == 0:
         print("Usage: taupkg remove <package>")
@@ -263,7 +267,7 @@ def cmd_remove(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: 
         rm_rf(pkg_dir)
 
     # Remove from lockfile (rebuild without it)
-    mut new_lf = LockFile.init()
+    mut new_lf = Lockfile.init()
     mut j = 0
     while j < lockfile.packages.len:
         mut p = lockfile.packages.get(j)
@@ -278,7 +282,7 @@ def cmd_remove(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: 
 
 # ── update ─────────────────────────────────────────────────────────────────────
 
-def cmd_update(args: CliArgs, manifest: Manifest, lockfile: LockFile, lock_path: str, project_root: str, verbose: bool) -> int:
+def cmd_update(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
     mut target = args.first_pos()  # "" = update all
 
     mut dep_names = _collect_dep_names(manifest, project_root)
@@ -290,8 +294,12 @@ def cmd_update(args: CliArgs, manifest: Manifest, lockfile: LockFile, lock_path:
             i = i + 1
             continue
 
-        mut constraint = manifest.deps.get(dep_name) if manifest.deps.contains(dep_name) else "*"
-        mut source_uri = manifest.sources.get(dep_name) if manifest.sources.contains(dep_name) else constraint
+        mut constraint = "*"
+        if manifest.deps.contains(dep_name):
+            constraint = manifest.deps.get(dep_name)
+        mut source_uri = constraint
+        if manifest.sources.contains(dep_name):
+            source_uri = manifest.sources.get(dep_name)
 
         print("Updating " + dep_name + "...")
         mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
@@ -308,7 +316,7 @@ def cmd_update(args: CliArgs, manifest: Manifest, lockfile: LockFile, lock_path:
 
 # ── build ──────────────────────────────────────────────────────────────────────
 
-def cmd_build(args: CliArgs, manifest: Manifest, lockfile: LockFile, project_root: str, verbose: bool) -> int:
+def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
     mut release = args.flag("release")
     mut output  = args.flag_val("o", "")
     mut ok = build_project(project_root, manifest, lockfile, output, release, verbose)
@@ -320,7 +328,7 @@ def cmd_build(args: CliArgs, manifest: Manifest, lockfile: LockFile, project_roo
 
 # ── test ───────────────────────────────────────────────────────────────────────
 
-def cmd_test(manifest: Manifest, lockfile: LockFile, project_root: str, verbose: bool) -> int:
+def cmd_test(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
     mut cc = find_compiler()
     mut test_dir = path_join(project_root, "tests")
     if not File.dir_exists(test_dir):
@@ -345,7 +353,7 @@ def cmd_test(manifest: Manifest, lockfile: LockFile, project_root: str, verbose:
 
 # ── list ───────────────────────────────────────────────────────────────────────
 
-def cmd_list(lockfile: LockFile) -> int:
+def cmd_list(lockfile: Lockfile) -> int:
     if lockfile.packages.len == 0:
         print("No packages installed.")
         return 0
@@ -360,7 +368,7 @@ def cmd_list(lockfile: LockFile) -> int:
 
 # ── info ───────────────────────────────────────────────────────────────────────
 
-def cmd_info(args: CliArgs, lockfile: LockFile) -> int:
+def cmd_info(args: CliArgs, lockfile: Lockfile) -> int:
     mut pkg_name = args.first_pos()
     if pkg_name.len() == 0:
         print("Usage: taupkg info <package>")

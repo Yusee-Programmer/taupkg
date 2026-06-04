@@ -14,7 +14,7 @@ from std.io import File
 from std.os import OS, Process, Env
 from util import path_join, mkdir_p, rm_rf, cp_r, project_build_dir, project_pkg_dir, shell_capture
 from manifest import Manifest
-from lockfile import LockFile, LockedPkg
+from lockfile import Lockfile, LockedPkg
 
 # Resolve the Tauraro compiler binary path.
 # 1. TAURARO_COMPILER env var (explicit override)
@@ -30,7 +30,7 @@ def find_compiler() -> str:
 
 # Prepare the build sandbox.
 # Copies project src/ and all installed packages into .taupkg/build/.
-def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: LockFile, verbose: bool) -> bool:
+def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfile, verbose: bool) -> bool:
     mut build_dir = project_build_dir(project_root)
     rm_rf(build_dir)
     mkdir_p(build_dir)
@@ -95,7 +95,7 @@ def run_compiler(project_root: str, manifest: Manifest, output: str, release: bo
 
 
 # High-level build: prepare sandbox + compile.
-def build_project(project_root: str, manifest: Manifest, lockfile: LockFile, output: str, release: bool, verbose: bool) -> bool:
+def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, verbose: bool) -> bool:
     if verbose:
         print("Preparing build sandbox...")
     mut ok = prepare_sandbox(project_root, manifest, lockfile, verbose)

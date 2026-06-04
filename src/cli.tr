@@ -117,7 +117,7 @@ Commands:
   install                  Install all deps listed in taupkg.toml
   update [pkg]             Update all (or one) dep to newest compatible
   build [--release] [-o f] Build the project
-  run [--release] [-- …]   Build and run
+  run [--release] [-- ...]  Build and run
   test                     Build and run tests
   search <query>           Search the registry
   publish                  Publish this package to the registry
