@@ -1,0 +1,127 @@
+# Build system integration for taupkg.
+#
+# Build sandbox layout (.taupkg/build/):
+#   src/          — copy of the project's src/ directory
+#   <pkgname>/    — installed package source (one dir per dep)
+#
+# Compiler invocation:
+#   tau.exe .taupkg/build/src/main.tr -o <output>
+#
+# The package dirs are top-level alongside src/ so that
+# `from pkgname import X` resolves without any compiler flag changes.
+
+from std.io import File
+from std.os import OS, Process, Env
+from util import path_join, mkdir_p, rm_rf, cp_r, project_build_dir, project_pkg_dir, shell_capture
+from manifest import Manifest
+from lockfile import LockFile, LockedPkg
+
+# Resolve the Tauraro compiler binary path.
+# 1. TAURARO_COMPILER env var (explicit override)
+# 2. tauraroc / tauraroc.exe on PATH
+def find_compiler() -> str:
+    mut env_cc = Env.get_var("TAURARO_COMPILER")
+    if env_cc.len() > 0:
+        return env_cc
+    if OS.is_windows():
+        return "tauraroc.exe"
+    return "tauraroc"
+
+
+# Prepare the build sandbox.
+# Copies project src/ and all installed packages into .taupkg/build/.
+def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: LockFile, verbose: bool) -> bool:
+    mut build_dir = project_build_dir(project_root)
+    rm_rf(build_dir)
+    mkdir_p(build_dir)
+
+    # Copy project source
+    mut src_src = path_join(project_root, "src")
+    mut src_dst = path_join(build_dir, "src")
+    if not File.dir_exists(src_src):
+        print("error: no src/ directory found in " + project_root)
+        return false
+    if verbose:
+        print("  copying src/ → " + src_dst)
+    mut ok = cp_r(src_src, src_dst)
+    if not ok:
+        print("error: failed to copy src/ directory")
+        return false
+
+    # Copy each installed package as a top-level directory
+    mut pkg_base = project_pkg_dir(project_root)
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        mut pkg_src = path_join(pkg_base, p.name)
+        mut pkg_dst = path_join(build_dir, p.name)
+        if not File.dir_exists(pkg_src):
+            print("warning: package " + p.name + " not found in " + pkg_base + ", skipping")
+            i = i + 1
+            continue
+        if verbose:
+            print("  linking " + p.name + "@" + p.version)
+        cp_r(pkg_src, pkg_dst)
+        i = i + 1
+
+    return true
+
+
+# Run the Tauraro compiler on the build sandbox.
+# Returns the compiler exit code (0 = success).
+def run_compiler(project_root: str, manifest: Manifest, output: str, release: bool, verbose: bool) -> int:
+    mut build_dir = project_build_dir(project_root)
+    mut cc = find_compiler()
+
+    mut entry = manifest.bin
+    if entry.len() == 0:
+        entry = "src/main.tr"
+    # Entry path relative to build_dir
+    mut entry_path = path_join(build_dir, entry)
+
+    mut out_path = output
+    if out_path.len() == 0:
+        out_path = path_join(project_root, manifest.name)
+        if OS.is_windows():
+            out_path = out_path + ".exe"
+
+    mut cmd = cc + " \"" + entry_path + "\" -o \"" + out_path + "\""
+    if release:
+        cmd = cmd + " -O3"
+    if verbose:
+        print("  " + cmd)
+
+    return Process.system(cmd)
+
+
+# High-level build: prepare sandbox + compile.
+def build_project(project_root: str, manifest: Manifest, lockfile: LockFile, output: str, release: bool, verbose: bool) -> bool:
+    if verbose:
+        print("Preparing build sandbox...")
+    mut ok = prepare_sandbox(project_root, manifest, lockfile, verbose)
+    if not ok:
+        return false
+    if verbose:
+        print("Compiling " + manifest.name + "...")
+    mut rc = run_compiler(project_root, manifest, output, release, verbose)
+    if rc != 0:
+        print("error: compilation failed (exit code " + str(rc) + ")")
+        return false
+    return true
+
+
+# Run the built binary (for `taupkg run`).
+def run_binary(project_root: str, manifest: Manifest, args: Vec[str]) -> int:
+    mut bin_name = manifest.name
+    if OS.is_windows():
+        bin_name = bin_name + ".exe"
+    mut bin_path = path_join(project_root, bin_name)
+    if not File.file_exists(bin_path):
+        print("error: binary not found at " + bin_path + ". Run `taupkg build` first.")
+        return 1
+    mut cmd = "\"" + bin_path + "\""
+    mut i = 0
+    while i < args.len:
+        cmd = cmd + " " + args.get(i)
+        i = i + 1
+    return Process.system(cmd)

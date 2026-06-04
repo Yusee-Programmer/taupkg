@@ -1,0 +1,57 @@
+from src.toml import toml_parse, TomlDoc
+
+def assert_eq(got: str, want: str, label: str):
+    if got != want:
+        print("FAIL " + label + ": got='" + got + "' want='" + want + "'")
+    else:
+        print("ok   " + label)
+
+def main() -> int:
+    mut content = """
+[package]
+name    = "mylib"
+version = "0.2.0"
+license = "Apache-2.0"  # inline comment
+
+[deps]
+http   = "^1.0.0"
+json   = "~2.3.0"
+
+[[author]]
+name  = "Alice"
+email = "alice@example.com"
+
+[[author]]
+name  = "Bob"
+email = "bob@example.com"
+"""
+
+    mut doc = toml_parse(content)
+
+    assert_eq(doc.get("package", "name"),    "mylib",      "package.name")
+    assert_eq(doc.get("package", "version"), "0.2.0",      "package.version")
+    assert_eq(doc.get("package", "license"), "Apache-2.0", "package.license inline comment stripped")
+
+    assert_eq(doc.get("deps", "http"), "^1.0.0", "deps.http")
+    assert_eq(doc.get("deps", "json"), "~2.3.0", "deps.json")
+
+    mut authors = doc.get_array("author")
+    assert_eq(str(authors.len), "2", "array section count")
+
+    mut a0 = authors.get(0)
+    assert_eq(a0.keys.get("name"),  "Alice",             "author[0].name")
+    assert_eq(a0.keys.get("email"), "alice@example.com", "author[0].email")
+
+    mut a1 = authors.get(1)
+    assert_eq(a1.keys.get("name"),  "Bob",               "author[1].name")
+    assert_eq(a1.keys.get("email"), "bob@example.com",   "author[1].email")
+
+    # Missing key returns ""
+    assert_eq(doc.get("package", "nonexistent"), "", "missing key returns empty")
+
+    # Missing section returns empty section (no crash)
+    mut ghost = doc.get_section("nosuchsection")
+    assert_eq(ghost.name, "nosuchsection", "missing section returns placeholder")
+
+    print("toml tests done")
+    return 0

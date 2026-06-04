@@ -1,0 +1,110 @@
+# Semantic version parsing and constraint matching.
+#
+# Supported constraint forms:
+#   *          any version
+#   1.2.3      exact
+#   ^1.2.3     >=1.2.3 <2.0.0  (compatible: same major)
+#   ~1.2.3     >=1.2.3 <1.3.0  (patch-compatible: same major.minor)
+#   >=1.2.3    explicit lower bound
+#   >1.2.3     exclusive lower bound
+
+class Version:
+    pub major: int
+    pub minor: int
+    pub patch: int
+
+extend Version:
+    pub def init(s: str) -> Version:
+        mut v = Version()
+        v.major = 0
+        v.minor = 0
+        v.patch = 0
+        mut clean = s.trim()
+        if clean.starts_with("v"):
+            clean = clean.slice(1, clean.len())
+        mut parts = clean.split(".")
+        if parts.len >= 1:
+            mut ms = parts.get(0)
+            if ms.len() > 0:
+                v.major = int(ms)
+        if parts.len >= 2:
+            mut ns = parts.get(1)
+            if ns.len() > 0:
+                v.minor = int(ns)
+        if parts.len >= 3:
+            mut ps = parts.get(2)
+            if ps.len() > 0:
+                v.patch = int(ps)
+        return v
+
+    pub def to_string(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
+
+    # Returns -1 (self < other), 0 (equal), 1 (self > other)
+    pub def compare(self, other: Version) -> int:
+        if self.major < other.major: return -1
+        if self.major > other.major: return 1
+        if self.minor < other.minor: return -1
+        if self.minor > other.minor: return 1
+        if self.patch < other.patch: return -1
+        if self.patch > other.patch: return 1
+        return 0
+
+    pub def eq(self, other: Version) -> bool:
+        return self.compare(other) == 0
+
+    pub def lt(self, other: Version) -> bool:
+        return self.compare(other) < 0
+
+    pub def gt(self, other: Version) -> bool:
+        return self.compare(other) > 0
+
+    pub def lte(self, other: Version) -> bool:
+        return self.compare(other) <= 0
+
+    pub def gte(self, other: Version) -> bool:
+        return self.compare(other) >= 0
+
+    # Returns true if this version satisfies the given constraint string.
+    pub def satisfies(self, constraint: str) -> bool:
+        mut c = constraint.trim()
+        if c == "*" or c == "":
+            return true
+        if c.starts_with("^"):
+            mut base = Version.init(c.slice(1, c.len()))
+            if self.lt(base): return false
+            return self.major == base.major
+        if c.starts_with("~"):
+            mut base = Version.init(c.slice(1, c.len()))
+            if self.lt(base): return false
+            return self.major == base.major and self.minor == base.minor
+        if c.starts_with(">="):
+            mut base = Version.init(c.slice(2, c.len()))
+            return self.gte(base)
+        if c.starts_with(">"):
+            mut base = Version.init(c.slice(1, c.len()))
+            return self.gt(base)
+        if c.starts_with("<="):
+            mut base = Version.init(c.slice(2, c.len()))
+            return self.lte(base)
+        if c.starts_with("<"):
+            mut base = Version.init(c.slice(1, c.len()))
+            return self.lt(base)
+        mut exact = Version.init(c)
+        return self.eq(exact)
+
+    # Returns the "best" version from a list that satisfies the constraint.
+    # Picks the highest compatible version. Returns "" if none satisfies.
+    pub def best_match(versions: Vec[str], constraint: str) -> str:
+        mut best = ""
+        mut best_ver = Version.init("0.0.0")
+        mut i = 0
+        while i < versions.len:
+            mut vs = versions.get(i)
+            mut v = Version.init(vs)
+            if v.satisfies(constraint):
+                if best == "" or v.gt(best_ver):
+                    best = vs
+                    best_ver = v
+            i = i + 1
+        return best

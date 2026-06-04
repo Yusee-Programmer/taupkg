@@ -1,0 +1,259 @@
+# tauraro_install.tr
+# Downloads and installs the Tauraro compiler from GitHub releases or tauraro.org.
+#
+# Zip layout (e.g. tauraroc-linux-arm64.zip):
+#   tauraroc-linux-arm64/
+#     tauraroc              ← compiler binary
+#     runtime/
+#       tauraro_rt.h        ← needed at every compilation
+#     std/                  ← standard library .tr sources
+#       io.tr, os.tr, ...
+#
+# The binary finds runtime/ and std/ relative to its own location, so
+# the whole extracted folder must stay together — we do NOT flatten it.
+#
+# Install destination: ~/.taupkg/bin/tauraroc-{os}-{arch}/
+# PATH: that subfolder is added so `tauraroc` is directly on PATH.
+#
+# What we do NOT need from the repo:
+#   src/       — compiler source, only needed to rebuild tauraroc itself
+#   examples/  — not needed by end users
+#
+# GitHub URL:  https://github.com/tauraro/tauraro/releases/download/v{ver}/tauraroc-{os}-{arch}.zip
+# Mirror URL:  https://tauraro.org/download/{ver}/tauraroc-{os}-{arch}.zip
+
+from std.io import File
+from std.os import OS, Process, Env
+from util import path_join, mkdir_p, taupkg_home, shell_capture
+
+# ── platform detection ────────────────────────────────────────────────────────
+
+def detect_os() -> str:
+    if OS.is_windows():
+        return "windows"
+    mut s = shell_capture("uname -s")
+    if s.contains("Darwin"):
+        return "macos"
+    return "linux"
+
+def detect_arch() -> str:
+    if OS.is_windows():
+        mut a = Env.get_var("PROCESSOR_ARCHITECTURE")
+        if a == "ARM64":
+            return "arm64"
+        return "x64"
+    mut m = shell_capture("uname -m")
+    if m == "aarch64" or m == "arm64":
+        return "arm64"
+    return "x64"
+
+# ── version resolution ────────────────────────────────────────────────────────
+
+# Fetch the latest release tag from the GitHub API.
+# Returns version without "v" prefix (e.g. "0.0.3"), or "" on failure.
+def fetch_latest_version() -> str:
+    mut json = shell_capture("curl -fsSL https://api.github.com/repos/tauraro/tauraro/releases/latest")
+    mut key = "\"tag_name\":"
+    mut pos = json.index_of(key)
+    if pos < 0:
+        return ""
+    mut after = json.slice(pos + key.len(), json.len()).trim()
+    if not after.starts_with("\""):
+        return ""
+    after = after.slice(1, after.len())
+    mut end = after.index_of("\"")
+    if end < 0:
+        return ""
+    mut tag = after.slice(0, end).trim()
+    if tag.starts_with("v"):
+        return tag.slice(1, tag.len())
+    return tag
+
+# ── download ──────────────────────────────────────────────────────────────────
+
+# curl ships on Windows 10+, macOS, and all major Linux distros.
+# -f = fail on HTTP error  -S = show errors  -L = follow redirects
+def curl_download(url: str, dest: str, verbose: bool) -> int:
+    mut silence = if verbose: "" else: "-s "
+    mut cmd = "curl " + silence + "-fSL -o \"" + dest + "\" \"" + url + "\""
+    return Process.system(cmd)
+
+# ── extraction ────────────────────────────────────────────────────────────────
+
+# Extract zip into dest_dir, preserving the top-level folder inside the zip.
+# After this, dest_dir/tauraroc-{os}-{arch}/ contains the binary + runtime/ + std/.
+def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
+    if os_name == "windows":
+        # tar handles zip on Windows 10+ (no extra install needed)
+        mut cmd = "tar -xf \"" + zip_path + "\" -C \"" + dest_dir + "\""
+        mut rc = Process.system(cmd)
+        if rc != 0:
+            # Fallback: PowerShell Expand-Archive for older Windows
+            cmd = "powershell -Command \"Expand-Archive -Force -Path '" + zip_path + "' -DestinationPath '" + dest_dir + "'\""
+            rc = Process.system(cmd)
+        return rc
+    else:
+        # unzip preserves the top-level directory from the zip
+        mut cmd = "unzip -oq \"" + zip_path + "\" -d \"" + dest_dir + "\""
+        mut rc = Process.system(cmd)
+        if rc != 0:
+            # Fallback: Python (available on almost every system)
+            cmd = "python3 -c \"import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])\" \"" + zip_path + "\" \"" + dest_dir + "\""
+            rc = Process.system(cmd)
+        return rc
+
+# ── PATH setup ────────────────────────────────────────────────────────────────
+
+# Windows: setx writes to the user's persistent PATH registry key.
+# The current session won't see it, but every new terminal will.
+def setup_path_windows(install_dir: str):
+    # Read current user PATH from registry to avoid clobbering it
+    mut cur = shell_capture("powershell -Command \"[Environment]::GetEnvironmentVariable('PATH','User')\"")
+    if cur.contains(install_dir):
+        print("  PATH already contains " + install_dir)
+        return
+    mut new_path = cur + ";" + install_dir
+    mut cmd = "powershell -Command \"[Environment]::SetEnvironmentVariable('PATH','" + new_path + "','User')\""
+    mut rc = Process.system(cmd)
+    if rc == 0:
+        print("  Added to user PATH. Open a new terminal to use tauraroc.")
+    else:
+        print("  Could not update PATH automatically.")
+        print("  Add this directory to your PATH manually:")
+        print("    " + install_dir)
+
+# Unix: append export line to shell profiles that exist, skip if already present.
+def setup_path_unix(install_dir: str):
+    mut export_line = "export PATH=\"" + install_dir + ":$PATH\""
+    mut marker = "# added by taupkg install-tauraro"
+
+    mut home = Env.get_var("HOME")
+    mut profiles = Vec[str].init(4)
+    profiles.push(path_join(home, ".profile"))
+    profiles.push(path_join(home, ".bashrc"))
+    profiles.push(path_join(home, ".zshrc"))
+
+    mut added = false
+    mut i = 0
+    while i < profiles.len:
+        mut p = profiles.get(i)
+        if File.file_exists(p):
+            mut content = File.read_text(p)
+            if not content.contains(install_dir):
+                File.write_text(p, content + "\n" + marker + "\n" + export_line + "\n")
+                print("  Updated " + p)
+                added = true
+        i = i + 1
+
+    if not added:
+        print("  Add this line to your shell profile (~/.bashrc, ~/.zshrc, etc.):")
+        print("    " + export_line)
+    else:
+        print("  Restart your terminal or run:  source ~/.profile")
+
+# ── main entry ────────────────────────────────────────────────────────────────
+
+def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
+    mut os_name = detect_os()
+    mut arch    = detect_arch()
+
+    mut ver = version.trim()
+    if ver.starts_with("v"):
+        ver = ver.slice(1, ver.len())
+
+    if ver.len() == 0:
+        print("Fetching latest version...")
+        ver = fetch_latest_version()
+        if ver.len() == 0:
+            print("error: could not determine latest version.")
+            print("       Pass --version x.y.z or check your internet connection.")
+            return 1
+
+    print("Installing tauraroc " + ver + " (" + os_name + "-" + arch + ")...")
+
+    # e.g. "tauraroc-linux-arm64"
+    mut pkg_stem = "tauraroc-" + os_name + "-" + arch
+    mut zip_name = pkg_stem + ".zip"
+    mut tag      = "v" + ver
+
+    mut url = ""
+    if use_mirror:
+        url = "https://tauraro.org/download/" + ver + "/" + zip_name
+    else:
+        url = "https://github.com/tauraro/tauraro/releases/download/" + tag + "/" + zip_name
+
+    # ~/.taupkg/bin/ holds one subfolder per installed tauraroc version/platform
+    mut bin_root = path_join(taupkg_home(), "bin")
+    mut zip_path = path_join(taupkg_home(), zip_name)
+    # The final install dir is the folder the zip extracts to
+    mut install_dir = path_join(bin_root, pkg_stem)
+    mkdir_p(bin_root)
+
+    # Remove stale install for this platform if present
+    if File.dir_exists(install_dir):
+        if os_name == "windows":
+            Process.system("rmdir /s /q \"" + install_dir + "\" 2>nul")
+        else:
+            Process.system("rm -rf \"" + install_dir + "\"")
+
+    # Download
+    if verbose:
+        print("  Downloading " + url)
+    mut rc = curl_download(url, zip_path, verbose)
+    if rc != 0:
+        if not use_mirror:
+            print("  GitHub download failed, trying tauraro.org mirror...")
+            mut mirror_url = "https://tauraro.org/download/" + ver + "/" + zip_name
+            rc = curl_download(mirror_url, zip_path, verbose)
+        if rc != 0:
+            print("error: download failed for " + zip_name)
+            print("       Check that version " + ver + " exists for " + os_name + "-" + arch + ".")
+            return 1
+
+    # Extract — zip contains tauraroc-{os}-{arch}/ as top-level folder
+    if verbose:
+        print("  Extracting to " + bin_root + "/")
+    mut ex_rc = extract_zip(zip_path, bin_root, os_name)
+    if ex_rc != 0:
+        print("error: extraction failed.")
+        if os_name != "windows":
+            print("       Make sure 'unzip' is installed (apt install unzip / brew install unzip).")
+        return 1
+
+    # Remove zip file
+    if os_name == "windows":
+        Process.system("del /f /q \"" + zip_path + "\" 2>nul")
+    else:
+        Process.system("rm -f \"" + zip_path + "\"")
+
+    # The binary lives at install_dir/tauraroc[.exe]
+    mut bin_name = "tauraroc"
+    if os_name == "windows":
+        bin_name = "tauraroc.exe"
+    mut bin_path = path_join(install_dir, bin_name)
+
+    # Ensure executable on Unix
+    if os_name != "windows":
+        Process.system("chmod +x \"" + bin_path + "\"")
+
+    # Quick smoke-test
+    mut check = shell_capture("\"" + bin_path + "\" --version 2>&1")
+    if check.len() > 0:
+        print("  OK: " + check)
+    elif verbose:
+        print("  (could not verify binary — it may still work)")
+
+    print("")
+    print("Installed:")
+    print("  binary:  " + bin_path)
+    print("  runtime: " + path_join(install_dir, "runtime/tauraro_rt.h"))
+    print("  std:     " + path_join(install_dir, "std/"))
+    print("")
+
+    # Add install_dir to PATH so `tauraroc` is found directly
+    if os_name == "windows":
+        setup_path_windows(install_dir)
+    else:
+        setup_path_unix(install_dir)
+
+    return 0

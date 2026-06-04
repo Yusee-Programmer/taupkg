@@ -1,0 +1,162 @@
+# Minimal TOML parser for taupkg config files.
+#
+# Handles the subset used by taupkg:
+#   [section]           simple section header
+#   [[array_section]]   array-of-tables header
+#   key = "string"      string value
+#   key = "value"       # with inline comment
+#
+# No floats, no dates, no inline tables, no multi-line strings.
+# Returns data as string maps — the callers cast to richer types.
+
+from std.io import File
+
+class TomlSection:
+    pub name: str
+    pub keys: Map[str, str]
+
+extend TomlSection:
+    pub def init(n: str) -> TomlSection:
+        mut s = TomlSection()
+        s.name = n
+        s.keys = Map[str, str].init(16)
+        return s
+
+class TomlDoc:
+    pub sections: Vec[TomlSection]
+    pub array_sections: Map[str, Vec[TomlSection]]
+
+extend TomlDoc:
+    pub def init() -> TomlDoc:
+        mut d = TomlDoc()
+        d.sections = Vec[TomlSection].init(8)
+        d.array_sections = Map[str, Vec[TomlSection]].init(4)
+        return d
+
+    # Get the first section with the given name, or an empty section.
+    pub def get_section(self, name: str) -> TomlSection:
+        mut i = 0
+        while i < self.sections.len:
+            mut s = self.sections.get(i)
+            if s.name == name: return s
+            i = i + 1
+        return TomlSection.init(name)
+
+    # Get array of sections for [[name]] tables.
+    pub def get_array(self, name: str) -> Vec[TomlSection]:
+        if self.array_sections.contains(name):
+            return self.array_sections.get(name)
+        return Vec[TomlSection].init(0)
+
+    # Convenience: get a key from a named section.
+    pub def get(self, section: str, key: str) -> str:
+        mut sec = self.get_section(section)
+        if sec.keys.contains(key): return sec.keys.get(key)
+        return ""
+
+
+def toml_strip_comment(line: str) -> str:
+    mut i = 0
+    mut in_str = false
+    while i < line.len():
+        mut c = line.char_at(i)
+        if c == 34 and not in_str:  # '"' = 34
+            in_str = true
+        elif c == 34 and in_str:
+            in_str = false
+        elif c == 35 and not in_str:  # '#' = 35
+            return line.slice(0, i).trim()
+        i = i + 1
+    return line
+
+
+def toml_unquote(s: str) -> str:
+    mut t = s.trim()
+    if t.starts_with("\"") and t.ends_with("\"") and t.len() >= 2:
+        return t.slice(1, t.len() - 1)
+    return t
+
+
+def toml_parse(content: str) -> TomlDoc:
+    mut doc = TomlDoc.init()
+    mut cur_section = TomlSection.init("_root")
+    mut cur_arr_name = ""
+    mut cur_arr_sec = TomlSection.init("")
+    mut in_array = false
+
+    mut lines = content.split("\n")
+    mut i = 0
+    while i < lines.len:
+        mut raw = lines.get(i)
+        mut line = raw.trim()
+        i = i + 1
+
+        if line.len() == 0 or line.starts_with("#"):
+            continue
+
+        # [[array_section]]
+        if line.starts_with("[[") and line.ends_with("]]"):
+            if in_array:
+                if doc.array_sections.contains(cur_arr_name):
+                    mut arr = doc.array_sections.get(cur_arr_name)
+                    arr.push(cur_arr_sec)
+                else:
+                    mut arr = Vec[TomlSection].init(4)
+                    arr.push(cur_arr_sec)
+                    doc.array_sections.insert(cur_arr_name, arr)
+            else:
+                doc.sections.push(cur_section)
+                cur_section = TomlSection.init("_root")
+            in_array = true
+            cur_arr_name = line.slice(2, line.len() - 2).trim()
+            cur_arr_sec = TomlSection.init(cur_arr_name)
+            continue
+
+        # [section]
+        if line.starts_with("[") and line.ends_with("]") and not line.starts_with("[["):
+            if in_array:
+                if doc.array_sections.contains(cur_arr_name):
+                    mut arr = doc.array_sections.get(cur_arr_name)
+                    arr.push(cur_arr_sec)
+                else:
+                    mut arr2 = Vec[TomlSection].init(4)
+                    arr2.push(cur_arr_sec)
+                    doc.array_sections.insert(cur_arr_name, arr2)
+                in_array = false
+            else:
+                doc.sections.push(cur_section)
+            mut sec_name = line.slice(1, line.len() - 1).trim()
+            cur_section = TomlSection.init(sec_name)
+            continue
+
+        # key = value
+        mut eq_pos = line.index_of("=")
+        if eq_pos >= 0:
+            mut key = line.slice(0, eq_pos).trim()
+            mut val_raw = line.slice(eq_pos + 1, line.len())
+            mut val = toml_unquote(toml_strip_comment(val_raw))
+            if in_array:
+                cur_arr_sec.keys.insert(key, val)
+            else:
+                cur_section.keys.insert(key, val)
+
+    # Flush the last section
+    if in_array:
+        if doc.array_sections.contains(cur_arr_name):
+            mut arr = doc.array_sections.get(cur_arr_name)
+            arr.push(cur_arr_sec)
+        else:
+            mut arr3 = Vec[TomlSection].init(4)
+            arr3.push(cur_arr_sec)
+            doc.array_sections.insert(cur_arr_name, arr3)
+    else:
+        doc.sections.push(cur_section)
+
+    return doc
+
+
+def toml_load(path: str) -> TomlDoc:
+    if not File.file_exists(path):
+        return TomlDoc.init()
+    mut content = File.read_text(path)
+    return toml_parse(content)

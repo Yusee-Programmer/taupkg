@@ -1,0 +1,68 @@
+# Source URI parsing for taupkg.
+#
+# Supported source URI forms:
+#   github:user/repo@v1.2.3      → clone from GitHub at tag/branch
+#   github:user/repo             → clone latest default branch
+#   git:https://host/repo@tag    → arbitrary git URL
+#   local:./relative/path        → local directory (symlinked/copied)
+#   local:/absolute/path         → absolute local directory
+#   registry:name@constraint     → (default) look up in official registry
+
+class Source:
+    pub kind: str      # "github" | "git" | "local" | "registry"
+    pub uri: str       # raw URL or path
+    pub ref: str       # tag / branch / commit; "" = default
+
+extend Source:
+    pub def init(kind: str, uri: str, ref: str) -> Source:
+        mut s = Source()
+        s.kind = kind
+        s.uri  = uri
+        s.ref  = ref
+        return s
+
+    pub def to_string(self) -> str:
+        if self.ref.len() > 0:
+            return self.kind + ":" + self.uri + "@" + self.ref
+        return self.kind + ":" + self.uri
+
+
+# Parse a raw source string from taupkg.toml [sources] or [deps].
+# Plain version constraints like "^1.2.0" are returned as registry sources.
+def parse_source(pkg_name: str, raw: str) -> Source:
+    mut s = raw.trim()
+
+    if s.starts_with("github:"):
+        mut rest = s.slice(7, s.len())
+        mut at_pos = rest.index_of("@")
+        if at_pos >= 0:
+            mut repo = rest.slice(0, at_pos)
+            mut ref  = rest.slice(at_pos + 1, rest.len())
+            mut url  = "https://github.com/" + repo + ".git"
+            return Source.init("github", url, ref)
+        else:
+            mut url = "https://github.com/" + rest + ".git"
+            return Source.init("github", url, "")
+
+    if s.starts_with("git:"):
+        mut rest = s.slice(4, s.len())
+        mut at_pos = rest.index_of("@")
+        if at_pos >= 0:
+            mut url = rest.slice(0, at_pos)
+            mut ref = rest.slice(at_pos + 1, rest.len())
+            return Source.init("git", url, ref)
+        return Source.init("git", rest, "")
+
+    if s.starts_with("local:"):
+        mut path = s.slice(6, s.len())
+        return Source.init("local", path, "")
+
+    # Default: treat the value as a version constraint → registry lookup
+    return Source.init("registry", pkg_name, s)
+
+
+# Build the git clone command for a git/github source.
+def source_clone_cmd(src: Source, dest_dir: str) -> str:
+    if src.ref.len() > 0:
+        return "git clone --depth 1 --branch " + src.ref + " " + src.uri + " " + dest_dir
+    return "git clone --depth 1 " + src.uri + " " + dest_dir

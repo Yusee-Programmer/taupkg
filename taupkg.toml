@@ -1,0 +1,10 @@
+[package]
+name    = "taupkg"
+version = "0.1.0"
+desc    = "Official package manager for the Tauraro language"
+authors = ["Yusee Habibu <yusee201520@gmail.com>"]
+license = "MIT"
+bin     = "src/main.tr"
+
+[deps]
+# taupkg uses only the Tauraro standard library

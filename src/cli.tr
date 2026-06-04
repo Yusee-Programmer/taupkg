@@ -1,0 +1,136 @@
+# CLI argument parsing for taupkg.
+#
+# Usage: taupkg <command> [options] [args...]
+#
+# Commands:
+#   init [name]            Create a new taupkg.toml in the current directory
+#   add  <pkg>[@ver]       Add a dependency and install it
+#   remove <pkg>           Remove a dependency
+#   install                Install all deps from taupkg.toml (respects lockfile)
+#   update [pkg]           Update deps to newest compatible versions
+#   build [--release] [-o out]  Build the project
+#   run [--release] [-- args]   Build and run
+#   test                   Run tests (tau test runner)
+#   search <query>         Search the registry
+#   publish                Publish this package to the registry
+#   info <pkg>             Show information about an installed or registry package
+#   list                   List installed packages
+#   clean                  Remove .taupkg/build/
+#   version                Print taupkg version
+
+class CliArgs:
+    pub command: str
+    pub pos_args: Vec[str]   # positional arguments after the command
+    pub flags: Map[str, str] # --key value or --flag (value = "true")
+    pub passthrough: Vec[str] # args after --
+
+extend CliArgs:
+    pub def init() -> CliArgs:
+        mut a = CliArgs()
+        a.command    = ""
+        a.pos_args   = Vec[str].init(4)
+        a.flags      = Map[str, str].init(8)
+        a.passthrough = Vec[str].init(4)
+        return a
+
+    pub def flag(self, name: str) -> bool:
+        return self.flags.contains(name)
+
+    pub def flag_val(self, name: str, default: str) -> str:
+        if self.flags.contains(name):
+            return self.flags.get(name)
+        return default
+
+    pub def first_pos(self) -> str:
+        if self.pos_args.len > 0:
+            return self.pos_args.get(0)
+        return ""
+
+
+# Parse sys.argv-style Vec[str].
+def parse_args(argv: Vec[str]) -> CliArgs:
+    mut a = CliArgs.init()
+    mut i = 0
+
+    # Skip program name (argv[0])
+    if argv.len > 0:
+        i = 1
+
+    # First non-flag arg is the command
+    if i < argv.len:
+        mut first = argv.get(i)
+        if not first.starts_with("-"):
+            a.command = first
+            i = i + 1
+
+    mut past_dashdash = false
+    while i < argv.len:
+        mut arg = argv.get(i)
+        if arg == "--":
+            past_dashdash = true
+            i = i + 1
+            continue
+        if past_dashdash:
+            a.passthrough.push(arg)
+            i = i + 1
+            continue
+        if arg.starts_with("--"):
+            mut key = arg.slice(2, arg.len())
+            # --key=value form
+            mut eq = key.index_of("=")
+            if eq >= 0:
+                mut val = key.slice(eq + 1, key.len())
+                key = key.slice(0, eq)
+                a.flags.insert(key, val)
+            # --key value form (next arg is value if it doesn't start with -)
+            elif i + 1 < argv.len and not argv.get(i + 1).starts_with("-"):
+                i = i + 1
+                a.flags.insert(key, argv.get(i))
+            else:
+                a.flags.insert(key, "true")
+        elif arg.starts_with("-") and arg.len() == 2:
+            # Short flag: -o output.exe
+            mut key = arg.slice(1, 2)
+            if i + 1 < argv.len and not argv.get(i + 1).starts_with("-"):
+                i = i + 1
+                a.flags.insert(key, argv.get(i))
+            else:
+                a.flags.insert(key, "true")
+        else:
+            a.pos_args.push(arg)
+        i = i + 1
+
+    return a
+
+
+def print_usage():
+    print("""
+taupkg — Tauraro package manager v0.1.0
+
+Usage:
+  taupkg <command> [options]
+
+Commands:
+  init [name]              Create taupkg.toml in the current directory
+  add <pkg>[@constraint]   Add a dependency (and install it)
+  remove <pkg>             Remove a dependency
+  install                  Install all deps listed in taupkg.toml
+  update [pkg]             Update all (or one) dep to newest compatible
+  build [--release] [-o f] Build the project
+  run [--release] [-- …]   Build and run
+  test                     Build and run tests
+  search <query>           Search the registry
+  publish                  Publish this package to the registry
+  info <pkg>               Show package information
+  list                     List installed packages
+  clean                    Remove .taupkg/build/
+  version                  Print taupkg version
+  install-tauraro          Download and install the Tauraro compiler
+    [--version x.y.z]        Install a specific version (default: latest)
+    [--mirror]               Use tauraro.org mirror instead of GitHub
+
+Options:
+  --verbose, -v            Show detailed output
+  --release                Compile with -O3 optimizations
+  -o <file>                Output binary path (build/run)
+""")

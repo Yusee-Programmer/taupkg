@@ -1,0 +1,102 @@
+# Registry client — communicates with the taupkg package registry.
+#
+# Registry API (REST over HTTP):
+#   GET /v1/packages/{name}/versions  → JSON: ["1.0.0","1.1.0",...]
+#   GET /v1/packages/{name}           → JSON: {name,description,clone_url,...}
+#
+# If the environment variable TAUPKG_REGISTRY is set, it overrides the default host.
+# Default: registry.taupkg.dev (port 443 / HTTPS — HttpClient handles TLS)
+
+from std.os import Env
+from std.net import HttpClient
+from util import shell_capture
+
+def registry_host() -> str:
+    mut h = Env.get_var("TAUPKG_REGISTRY")
+    if h.len() > 0:
+        return h
+    return "registry.taupkg.dev"
+
+
+# Fetch the list of available version strings for a package.
+# Returns an empty Vec on network or parse error.
+def registry_fetch_versions(pkg_name: str) -> Vec[str]:
+    mut versions = Vec[str].init(8)
+    mut host = registry_host()
+    mut client = HttpClient.init(host, 443)
+    mut resp = client.get("/v1/packages/" + pkg_name + "/versions")
+    if resp.status != 200:
+        return versions
+    # Parse JSON array ["1.0.0","1.1.0",...] — minimal hand-parser
+    mut body = resp.body.trim()
+    if not body.starts_with("["):
+        return versions
+    mut inner = body.slice(1, body.len() - 1).trim()
+    if inner.len() == 0:
+        return versions
+    mut parts = inner.split(",")
+    mut i = 0
+    while i < parts.len:
+        mut v = parts.get(i).trim()
+        # Strip surrounding quotes
+        if v.starts_with("\"") and v.ends_with("\"") and v.len() >= 2:
+            v = v.slice(1, v.len() - 1)
+        if v.len() > 0:
+            versions.push(v)
+        i = i + 1
+    return versions
+
+
+# Fetch the git clone URL for a package from the registry.
+def registry_clone_url(pkg_name: str) -> str:
+    mut host = registry_host()
+    mut client = HttpClient.init(host, 443)
+    mut resp = client.get("/v1/packages/" + pkg_name)
+    if resp.status != 200:
+        # Fallback: assume GitHub under the taupkg-packages org
+        return "https://github.com/taupkg-packages/" + pkg_name + ".git"
+    # Extract "clone_url":"..." from JSON — simple search
+    mut body = resp.body
+    mut key = "\"clone_url\":"
+    mut pos = body.index_of(key)
+    if pos < 0:
+        return "https://github.com/taupkg-packages/" + pkg_name + ".git"
+    mut after = body.slice(pos + key.len(), body.len()).trim()
+    if after.starts_with("\""):
+        after = after.slice(1, after.len())
+        mut end = after.index_of("\"")
+        if end >= 0:
+            return after.slice(0, end)
+    return "https://github.com/taupkg-packages/" + pkg_name + ".git"
+
+
+# Search the registry for packages matching a query string.
+# Prints results to stdout (used by `taupkg search`).
+def registry_search(query: str):
+    mut host = registry_host()
+    mut client = HttpClient.init(host, 443)
+    mut resp = client.get("/v1/search?q=" + query)
+    if resp.status != 200:
+        print("error: registry search failed (HTTP " + str(resp.status) + ")")
+        return
+    print(resp.body)
+
+
+# Publish a package to the registry.
+# Requires TAUPKG_TOKEN env variable.
+def registry_publish(manifest_path: str, tarball_path: str) -> bool:
+    mut token = Env.get_var("TAUPKG_TOKEN")
+    if token.len() == 0:
+        print("error: TAUPKG_TOKEN not set. Run `taupkg login` first.")
+        return false
+    mut host = registry_host()
+    # Use curl for multipart upload (HttpClient doesn't support multipart yet)
+    mut cmd = "curl -s -X POST https://" + host + "/v1/publish"
+    cmd = cmd + " -H \"Authorization: Bearer " + token + "\""
+    cmd = cmd + " -F \"manifest=@" + manifest_path + "\""
+    cmd = cmd + " -F \"tarball=@" + tarball_path + "\""
+    mut out = shell_capture(cmd)
+    if out.contains("\"ok\":true") or out.contains("\"status\":\"ok\""):
+        return true
+    print("Registry response: " + out)
+    return false

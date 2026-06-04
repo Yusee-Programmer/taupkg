@@ -1,0 +1,123 @@
+# Installer — fetch and install packages into .taupkg/packages/<name>/.
+#
+# Install flow:
+#   1. Parse source URI to get kind/url/ref
+#   2. For git/github: git clone into .taupkg/packages/<name>/
+#   3. For local: copy the directory into .taupkg/packages/<name>/
+#   4. For registry: fetch version list, pick best, then treat as git source
+#   5. Compute checksum of installed taupkg.toml (stable identity)
+#   6. Return LockedPkg for the lockfile
+
+from std.io import File
+from std.os import OS, Process
+from util import path_join, mkdir_p, rm_rf, cp_r, shell_capture, project_pkg_dir
+from source import Source, parse_source, source_clone_cmd
+from manifest import Manifest
+from lockfile import LockedPkg
+from semver import Version
+
+# Install a single package into the project's packages directory.
+# Returns a LockedPkg describing what was installed, or an empty LockedPkg on failure.
+def install_package(
+    pkg_name: str,
+    constraint: str,
+    source_uri: str,
+    project_root: str,
+    verbose: bool
+) -> LockedPkg:
+    mut src = parse_source(pkg_name, source_uri)
+    mut pkg_dir = path_join(project_pkg_dir(project_root), pkg_name)
+
+    # Remove stale install if present
+    if File.dir_exists(pkg_dir):
+        rm_rf(pkg_dir)
+
+    mkdir_p(project_pkg_dir(project_root))
+
+    mut installed_version = ""
+    mut installed_source  = src.to_string()
+
+    if src.kind == "local":
+        if verbose:
+            print("  [local] Copying " + src.uri + " → " + pkg_dir)
+        mut ok = cp_r(src.uri, pkg_dir)
+        if not ok:
+            print("error: failed to copy local package " + pkg_name + " from " + src.uri)
+            return LockedPkg.init("", "", "", "")
+        mut mf = Manifest.load(path_join(pkg_dir, "taupkg.toml"))
+        installed_version = mf.version
+
+    elif src.kind == "github" or src.kind == "git":
+        mut cmd = source_clone_cmd(src, pkg_dir)
+        if verbose:
+            print("  [git] " + cmd)
+        mut rc = Process.system(cmd)
+        if rc != 0:
+            print("error: git clone failed for " + pkg_name)
+            return LockedPkg.init("", "", "", "")
+        mut mf = Manifest.load(path_join(pkg_dir, "taupkg.toml"))
+        installed_version = mf.version
+        if installed_version.len() == 0:
+            installed_version = src.ref
+
+    elif src.kind == "registry":
+        # Registry install: ask registry for available versions, pick best, then clone
+        mut reg_result = registry_resolve(pkg_name, constraint)
+        if reg_result.version.len() == 0:
+            print("error: no version of " + pkg_name + " satisfies " + constraint)
+            return LockedPkg.init("", "", "", "")
+        if verbose:
+            print("  [registry] " + pkg_name + "@" + reg_result.version + " → " + reg_result.clone_url)
+        mut git_src = Source.init("git", reg_result.clone_url, reg_result.tag)
+        mut cmd = source_clone_cmd(git_src, pkg_dir)
+        mut rc = Process.system(cmd)
+        if rc != 0:
+            print("error: failed to fetch " + pkg_name + " from registry")
+            return LockedPkg.init("", "", "", "")
+        installed_version = reg_result.version
+        installed_source  = git_src.to_string()
+
+    else:
+        print("error: unknown source kind '" + src.kind + "' for " + pkg_name)
+        return LockedPkg.init("", "", "", "")
+
+    # Checksum: sha256 of the installed taupkg.toml (or "none" if absent)
+    mut manifest_path = path_join(pkg_dir, "taupkg.toml")
+    mut checksum = "none"
+    if File.file_exists(manifest_path):
+        mut content = File.read_text(manifest_path)
+        checksum = "sha256:" + Hash.sha256(content)
+
+    return LockedPkg.init(pkg_name, installed_version, installed_source, checksum)
+
+
+# Result returned by registry_resolve.
+class RegistryResult:
+    pub version: str
+    pub clone_url: str
+    pub tag: str
+
+extend RegistryResult:
+    pub def init(v: str, url: str, tag: str) -> RegistryResult:
+        mut r = RegistryResult()
+        r.version   = v
+        r.clone_url = url
+        r.tag       = tag
+        return r
+
+
+# Ask the official taupkg registry for the best matching version.
+# Returns empty RegistryResult if resolution fails.
+def registry_resolve(pkg_name: str, constraint: str) -> RegistryResult:
+    from registry import registry_fetch_versions, registry_clone_url
+    mut versions = registry_fetch_versions(pkg_name)
+    if versions.len == 0:
+        return RegistryResult.init("", "", "")
+    mut best = Version.best_match(versions, constraint)
+    if best.len() == 0:
+        return RegistryResult.init("", "", "")
+    mut url = registry_clone_url(pkg_name)
+    mut tag = "v" + best
+    if not tag.starts_with("v"):
+        tag = best
+    return RegistryResult.init(best, url, tag)

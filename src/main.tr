@@ -1,0 +1,449 @@
+# taupkg — Tauraro package manager
+# Entry point: command dispatch.
+
+from std.io import File
+from std.os import OS, Process, Env
+from cli import parse_args, print_usage, CliArgs
+from manifest import Manifest, find_manifest
+from lockfile import LockFile, LockedPkg
+from semver import Version
+from source import parse_source
+from installer import install_package
+from builder import build_project, run_binary, find_compiler
+from registry import registry_search
+from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf
+from tauraro_install import install_tauraro
+
+def main(argv: Vec[str]) -> int:
+    mut args = parse_args(argv)
+    mut verbose = args.flag("verbose") or args.flag("v")
+
+    if args.command == "" or args.command == "help" or args.flag("help") or args.flag("h"):
+        print_usage()
+        return 0
+
+    if args.command == "version":
+        print("taupkg 0.1.0")
+        return 0
+
+    if args.command == "install-tauraro":
+        mut ver     = args.flag_val("version", "")
+        mut mirror  = args.flag("mirror")
+        return install_tauraro(ver, mirror, verbose)
+
+    if args.command == "init":
+        return cmd_init(args)
+
+    if args.command == "search":
+        return cmd_search(args)
+
+    # All remaining commands need a project root with taupkg.toml
+    mut cwd = OS.cwd()
+    mut manifest_path = find_manifest(cwd)
+    if manifest_path.len() == 0:
+        manifest_path = path_join(cwd, "taupkg.toml")
+        if not File.file_exists(manifest_path):
+            print("error: no taupkg.toml found. Run `taupkg init` first.")
+            return 1
+
+    mut project_root = path_join(manifest_path, "..")
+    mut manifest = Manifest.load(manifest_path)
+    if not manifest.is_valid():
+        print("error: invalid taupkg.toml — 'name' and 'version' are required")
+        return 1
+
+    mut lock_path = path_join(project_root, "taupkg.lock")
+    mut lockfile  = LockFile.load(lock_path)
+
+    if args.command == "install":
+        return cmd_install(manifest, lockfile, lock_path, project_root, verbose)
+
+    if args.command == "add":
+        return cmd_add(args, manifest, manifest_path, lockfile, lock_path, project_root, verbose)
+
+    if args.command == "remove":
+        return cmd_remove(args, manifest, manifest_path, lockfile, lock_path, project_root)
+
+    if args.command == "update":
+        return cmd_update(args, manifest, lockfile, lock_path, project_root, verbose)
+
+    if args.command == "build":
+        return cmd_build(args, manifest, lockfile, project_root, verbose)
+
+    if args.command == "run":
+        mut rc = cmd_build(args, manifest, lockfile, project_root, verbose)
+        if rc != 0:
+            return rc
+        return run_binary(project_root, manifest, args.passthrough)
+
+    if args.command == "test":
+        return cmd_test(manifest, lockfile, project_root, verbose)
+
+    if args.command == "list":
+        return cmd_list(lockfile)
+
+    if args.command == "info":
+        return cmd_info(args, lockfile)
+
+    if args.command == "clean":
+        rm_rf(project_build_dir(project_root))
+        print("Cleaned .taupkg/build/")
+        return 0
+
+    if args.command == "publish":
+        return cmd_publish(manifest, manifest_path, project_root, verbose)
+
+    print("error: unknown command '" + args.command + "'. Run `taupkg help` for usage.")
+    return 1
+
+
+# ── init ──────────────────────────────────────────────────────────────────────
+
+def cmd_init(args: CliArgs) -> int:
+    mut cwd = OS.cwd()
+    mut toml_path = path_join(cwd, "taupkg.toml")
+    if File.file_exists(toml_path):
+        print("taupkg.toml already exists.")
+        return 1
+
+    mut name = args.first_pos()
+    if name.len() == 0:
+        # Derive from directory name
+        mut parts = cwd.split("/")
+        if parts.len == 0:
+            parts = cwd.split("\\")
+        if parts.len > 0:
+            name = parts.get(parts.len - 1)
+        else:
+            name = "myproject"
+    name = name.to_lower()
+
+    mut content = "[package]\n"
+    content = content + "name    = \"" + name + "\"\n"
+    content = content + "version = \"0.1.0\"\n"
+    content = content + "desc    = \"\"\n"
+    content = content + "license = \"MIT\"\n"
+    content = content + "bin     = \"src/main.tr\"\n\n"
+    content = content + "[deps]\n"
+
+    File.write_text(toml_path, content)
+    mkdir_p(path_join(cwd, "src"))
+
+    mut main_path = path_join(cwd, "src/main.tr")
+    if not File.file_exists(main_path):
+        File.write_text(main_path, "def main() -> int:\n    print(\"Hello from " + name + "!\")\n    return 0\n")
+
+    print("Created taupkg.toml and src/main.tr")
+    return 0
+
+
+# ── install ────────────────────────────────────────────────────────────────────
+
+def cmd_install(manifest: Manifest, lockfile: LockFile, lock_path: str, project_root: str, verbose: bool) -> int:
+    mut changed = false
+    mut failed = false
+
+    # Iterate deps via a Vec of (name, constraint) pairs we build from manifest.deps
+    # (Map has no iterator, so we resolve by looking at lockfile entries first then fresh deps)
+    # Note: we can't enumerate Map keys directly — instead we iterate over lockfile entries
+    # and also process any dep names we received via the manifest sections object.
+    # For now, we read the raw toml dep section again to get the keys.
+    mut dep_names  = _collect_dep_names(manifest, project_root)
+
+    mut i = 0
+    while i < dep_names.len:
+        mut dep_name = dep_names.get(i)
+        mut constraint = manifest.deps.get(dep_name) if manifest.deps.contains(dep_name) else "*"
+        mut source_uri = manifest.sources.get(dep_name) if manifest.sources.contains(dep_name) else constraint
+
+        # Check lockfile — use locked version if it satisfies constraint
+        if lockfile.has(dep_name):
+            mut locked = lockfile.find(dep_name)
+            mut v = Version.init(locked.version)
+            if v.satisfies(constraint) and File.dir_exists(path_join(project_pkg_dir(project_root), dep_name)):
+                if verbose:
+                    print("  " + dep_name + "@" + locked.version + " (locked, up-to-date)")
+                i = i + 1
+                continue
+
+        if verbose:
+            print("Installing " + dep_name + " " + constraint + "...")
+        else:
+            print("Installing " + dep_name + "...")
+
+        mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
+        if pkg.name.len() == 0:
+            failed = true
+        else:
+            lockfile.upsert(pkg)
+            changed = true
+            print("  + " + dep_name + "@" + pkg.version)
+
+        i = i + 1
+
+    if changed:
+        lockfile.save(lock_path)
+
+    if failed:
+        print("Some packages failed to install.")
+        return 1
+
+    if dep_names.len == 0:
+        print("No dependencies to install.")
+    else:
+        print("All packages installed.")
+    return 0
+
+
+# ── add ────────────────────────────────────────────────────────────────────────
+
+def cmd_add(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: LockFile, lock_path: str, project_root: str, verbose: bool) -> int:
+    mut spec = args.first_pos()
+    if spec.len() == 0:
+        print("Usage: taupkg add <package>[@constraint]")
+        return 1
+
+    # Split name@constraint
+    mut dep_name   = spec
+    mut constraint = "*"
+    mut at_pos = spec.index_of("@")
+    if at_pos >= 0:
+        dep_name   = spec.slice(0, at_pos)
+        constraint = spec.slice(at_pos + 1, spec.len())
+
+    mut source_uri = constraint
+    if args.pos_args.len > 1:
+        source_uri = args.pos_args.get(1)  # explicit source URI
+
+    print("Adding " + dep_name + " " + constraint + "...")
+    mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
+    if pkg.name.len() == 0:
+        return 1
+
+    # Update taupkg.toml [deps]
+    mut content = File.read_text(manifest_path)
+    mut dep_line = dep_name + " = \"" + constraint + "\"\n"
+    if content.contains("[deps]"):
+        content = content + dep_line
+    else:
+        content = content + "\n[deps]\n" + dep_line
+    File.write_text(manifest_path, content)
+
+    lockfile.upsert(pkg)
+    lockfile.save(lock_path)
+    print("  + " + dep_name + "@" + pkg.version)
+    return 0
+
+
+# ── remove ─────────────────────────────────────────────────────────────────────
+
+def cmd_remove(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: LockFile, lock_path: str, project_root: str) -> int:
+    mut dep_name = args.first_pos()
+    if dep_name.len() == 0:
+        print("Usage: taupkg remove <package>")
+        return 1
+
+    # Remove from taupkg.toml by rewriting without that line
+    mut content = File.read_text(manifest_path)
+    mut lines = content.split("\n")
+    mut out = ""
+    mut i = 0
+    while i < lines.len:
+        mut line = lines.get(i)
+        mut trimmed = line.trim()
+        # Skip any line that starts with the dep name followed by ' =' or '='
+        if not (trimmed.starts_with(dep_name) and trimmed.contains("=")):
+            out = out + line + "\n"
+        i = i + 1
+    File.write_text(manifest_path, out)
+
+    # Remove from .taupkg/packages/
+    mut pkg_dir = path_join(project_pkg_dir(project_root), dep_name)
+    if File.dir_exists(pkg_dir):
+        rm_rf(pkg_dir)
+
+    # Remove from lockfile (rebuild without it)
+    mut new_lf = LockFile.init()
+    mut j = 0
+    while j < lockfile.packages.len:
+        mut p = lockfile.packages.get(j)
+        if p.name != dep_name:
+            new_lf.packages.push(p)
+        j = j + 1
+    new_lf.save(lock_path)
+
+    print("Removed " + dep_name)
+    return 0
+
+
+# ── update ─────────────────────────────────────────────────────────────────────
+
+def cmd_update(args: CliArgs, manifest: Manifest, lockfile: LockFile, lock_path: str, project_root: str, verbose: bool) -> int:
+    mut target = args.first_pos()  # "" = update all
+
+    mut dep_names = _collect_dep_names(manifest, project_root)
+    mut changed = false
+    mut i = 0
+    while i < dep_names.len:
+        mut dep_name = dep_names.get(i)
+        if target.len() > 0 and dep_name != target:
+            i = i + 1
+            continue
+
+        mut constraint = manifest.deps.get(dep_name) if manifest.deps.contains(dep_name) else "*"
+        mut source_uri = manifest.sources.get(dep_name) if manifest.sources.contains(dep_name) else constraint
+
+        print("Updating " + dep_name + "...")
+        mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
+        if pkg.name.len() > 0:
+            lockfile.upsert(pkg)
+            changed = true
+            print("  → " + dep_name + "@" + pkg.version)
+        i = i + 1
+
+    if changed:
+        lockfile.save(lock_path)
+    return 0
+
+
+# ── build ──────────────────────────────────────────────────────────────────────
+
+def cmd_build(args: CliArgs, manifest: Manifest, lockfile: LockFile, project_root: str, verbose: bool) -> int:
+    mut release = args.flag("release")
+    mut output  = args.flag_val("o", "")
+    mut ok = build_project(project_root, manifest, lockfile, output, release, verbose)
+    if ok:
+        print("Build succeeded.")
+        return 0
+    return 1
+
+
+# ── test ───────────────────────────────────────────────────────────────────────
+
+def cmd_test(manifest: Manifest, lockfile: LockFile, project_root: str, verbose: bool) -> int:
+    mut cc = find_compiler()
+    mut test_dir = path_join(project_root, "tests")
+    if not File.dir_exists(test_dir):
+        print("No tests/ directory found.")
+        return 0
+
+    # Find test files: tests/test_*.tr
+    mut rc = Process.system("ls \"" + test_dir + "\"")  # for now just check dir is non-empty
+    # TODO: When tau gets a built-in test runner, delegate here.
+    # For now, compile and run each test_*.tr file.
+    print("Running tests in " + test_dir + "...")
+    mut cmd = cc + " " + test_dir + "/test_*.tr -o .taupkg/test_runner"
+    if OS.is_windows():
+        cmd = cc + " \"" + test_dir + "\\test_all.tr\" -o \".taupkg\\test_runner.exe\""
+    mut result = Process.system(cmd)
+    if result != 0:
+        return result
+    if OS.is_windows():
+        return Process.system(".taupkg\\test_runner.exe")
+    return Process.system(".taupkg/test_runner")
+
+
+# ── list ───────────────────────────────────────────────────────────────────────
+
+def cmd_list(lockfile: LockFile) -> int:
+    if lockfile.packages.len == 0:
+        print("No packages installed.")
+        return 0
+    print("Installed packages:")
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        print("  " + p.name + " " + p.version)
+        i = i + 1
+    return 0
+
+
+# ── info ───────────────────────────────────────────────────────────────────────
+
+def cmd_info(args: CliArgs, lockfile: LockFile) -> int:
+    mut pkg_name = args.first_pos()
+    if pkg_name.len() == 0:
+        print("Usage: taupkg info <package>")
+        return 1
+    if lockfile.has(pkg_name):
+        mut p = lockfile.find(pkg_name)
+        print("Name:     " + p.name)
+        print("Version:  " + p.version)
+        print("Source:   " + p.source)
+        print("Checksum: " + p.checksum)
+        return 0
+    print("Package '" + pkg_name + "' is not installed. Use `taupkg search` to find it.")
+    return 1
+
+
+# ── search ─────────────────────────────────────────────────────────────────────
+
+def cmd_search(args: CliArgs) -> int:
+    mut query = args.first_pos()
+    if query.len() == 0:
+        print("Usage: taupkg search <query>")
+        return 1
+    registry_search(query)
+    return 0
+
+
+# ── publish ────────────────────────────────────────────────────────────────────
+
+def cmd_publish(manifest: Manifest, manifest_path: str, project_root: str, verbose: bool) -> int:
+    from registry import registry_publish
+    # Create a tarball of the project src/
+    mut tarball = path_join(project_root, ".taupkg/" + manifest.name + "-" + manifest.version + ".tar.gz")
+    mkdir_p(path_join(project_root, ".taupkg"))
+    mut src_dir = path_join(project_root, "src")
+    mut cmd = ""
+    if OS.is_windows():
+        print("error: publish tarball creation not supported on Windows yet. Use WSL or git archive.")
+        return 1
+    else:
+        cmd = "tar -czf \"" + tarball + "\" -C \"" + project_root + "\" src/"
+    mut rc = Process.system(cmd)
+    if rc != 0:
+        print("error: failed to create tarball")
+        return 1
+    mut ok = registry_publish(manifest_path, tarball)
+    if ok:
+        print("Published " + manifest.name + " " + manifest.version)
+        return 0
+    return 1
+
+
+# ── internal helpers ───────────────────────────────────────────────────────────
+
+# Re-parse the manifest TOML to get dep names as a Vec[str].
+# This exists because Map has no key-iteration; we parse the raw file.
+def _collect_dep_names(manifest: Manifest, project_root: str) -> Vec[str]:
+    from toml import toml_load
+    mut result = Vec[str].init(8)
+    mut toml_path = path_join(project_root, "taupkg.toml")
+    if not File.file_exists(toml_path):
+        return result
+    mut doc = toml_load(toml_path)
+    mut deps_sec = doc.get_section("deps")
+    # deps_sec.keys is a Map — we cannot iterate it directly.
+    # Instead, compare against lockfile names + manifest dep names we know about.
+    # Best approach: re-read raw lines of the [deps] section.
+    mut content = File.read_text(toml_path)
+    mut lines = content.split("\n")
+    mut in_deps = false
+    mut i = 0
+    while i < lines.len:
+        mut line = lines.get(i).trim()
+        if line == "[deps]" or line == "[dependencies]":
+            in_deps = true
+            i = i + 1
+            continue
+        if in_deps and line.starts_with("["):
+            in_deps = false
+        if in_deps and line.len() > 0 and not line.starts_with("#"):
+            mut eq = line.index_of("=")
+            if eq > 0:
+                mut name = line.slice(0, eq).trim()
+                if name.len() > 0:
+                    result.push(name)
+        i = i + 1
+    return result
