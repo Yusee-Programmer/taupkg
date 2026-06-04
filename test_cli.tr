@@ -1,5 +1,0 @@
-﻿from cli import CliArgs, parse_args, print_usage
-
-def main(argv: Vec[str]) -> int:
-    print_usage()
-    return 0

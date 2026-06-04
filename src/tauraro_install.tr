@@ -85,12 +85,13 @@ pub def curl_download(url: str, dest: str, verbose: bool) -> int:
 # After this, dest_dir/tauraroc-{os}-{arch}/ contains the binary + runtime/ + std/.
 pub def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
     if os_name == "windows":
-        # tar handles zip on Windows 10+ (no extra install needed)
-        mut cmd = "tar -xf \"" + zip_path + "\" -C \"" + dest_dir + "\""
+        # PowerShell Expand-Archive works reliably with Windows paths (including spaces
+        # and drive letters that confuse Git-Bash tar).
+        mut cmd = "powershell -Command \"Expand-Archive -Force -Path '" + zip_path + "' -DestinationPath '" + dest_dir + "'\""
         mut rc = Process.system(cmd)
         if rc != 0:
-            # Fallback: PowerShell Expand-Archive for older Windows
-            cmd = "powershell -Command \"Expand-Archive -Force -Path '" + zip_path + "' -DestinationPath '" + dest_dir + "'\""
+            # Fallback: unzip via Git Bash (available on most Windows dev machines)
+            cmd = "unzip -oq \"" + zip_path + "\" -d \"" + dest_dir + "\""
             rc = Process.system(cmd)
         return rc
     else:
@@ -227,18 +228,53 @@ pub def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
     else:
         Process.system("rm -f \"" + zip_path + "\"")
 
-    # The binary lives at install_dir/tauraroc[.exe]
+    # Locate the binary inside the extracted tree.
+    # New zips have layout: tauraroc-{platform}/tauraroc[.exe]
+    # Legacy zips (full-repo) have the binary at the root of bin_root.
     mut bin_name = "tauraroc"
     if os_name == "windows":
         bin_name = "tauraroc.exe"
+
+    # Preferred: structured subfolder
     mut bin_path = path_join(install_dir, bin_name)
+    if not File.file_exists(bin_path):
+        # Fallback: flat zip extracted directly into bin_root
+        mut flat_bin = path_join(bin_root, bin_name)
+        if File.file_exists(flat_bin):
+            # Move it into the expected subfolder so PATH points correctly
+            mkdir_p(install_dir)
+            if os_name == "windows":
+                Process.system("move /y \"" + flat_bin + "\" \"" + install_dir + "\" 2>nul")
+            else:
+                Process.system("mv \"" + flat_bin + "\" \"" + install_dir + "/\"")
+            # Also move runtime/ and std/ if present at bin_root level
+            mut rt_src = path_join(bin_root, "runtime")
+            mut std_src = path_join(bin_root, "std")
+            if File.dir_exists(rt_src):
+                if os_name == "windows":
+                    Process.system("move /y \"" + rt_src + "\" \"" + install_dir + "\" 2>nul")
+                else:
+                    Process.system("mv \"" + rt_src + "\" \"" + install_dir + "/\"")
+            if File.dir_exists(std_src):
+                if os_name == "windows":
+                    Process.system("move /y \"" + std_src + "\" \"" + install_dir + "\" 2>nul")
+                else:
+                    Process.system("mv \"" + std_src + "\" \"" + install_dir + "/\"")
+        else:
+            print("error: could not find tauraroc binary after extraction.")
+            print("       Expected: " + bin_path)
+            return 1
 
     # Ensure executable on Unix
     if os_name != "windows":
         Process.system("chmod +x \"" + bin_path + "\"")
 
-    # Quick smoke-test
-    mut check = shell_capture("\"" + bin_path + "\" --version 2>&1")
+    # Quick smoke-test — run via shell with proper quoting
+    mut check = ""
+    if os_name == "windows":
+        check = shell_capture("\"" + bin_path + "\" --version")
+    else:
+        check = shell_capture("\"" + bin_path + "\" --version 2>/dev/null")
     if check.len() > 0:
         print("  OK: " + check)
     elif verbose:
