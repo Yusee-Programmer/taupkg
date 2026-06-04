@@ -8,7 +8,7 @@
 #   >=1.2.3    explicit lower bound
 #   >1.2.3     exclusive lower bound
 
-class Version:
+pub class Version:
     pub major: int
     pub minor: int
     pub patch: int

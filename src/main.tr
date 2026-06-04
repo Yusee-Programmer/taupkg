@@ -14,7 +14,7 @@ from registry import registry_search
 from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf
 from tauraro_install import install_tauraro
 
-def main(argv: Vec[str]) -> int:
+def main(argv: Vec[str]):
     mut args = parse_args(argv)
     mut verbose = args.flag("verbose") or args.flag("v")
 
@@ -94,7 +94,6 @@ def main(argv: Vec[str]) -> int:
         return cmd_publish(manifest, manifest_path, project_root, verbose)
 
     print("error: unknown command '" + args.command + "'. Run `taupkg help` for usage.")
-    return 1
 
 
 # -- init ----------------------------------------------------------------------

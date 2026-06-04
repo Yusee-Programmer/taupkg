@@ -11,7 +11,7 @@ from std.os import Env
 from std.net import HttpClient
 from util import shell_capture
 
-def registry_host() -> str:
+pub def registry_host() -> str:
     mut h = Env.get_var("TAUPKG_REGISTRY")
     if h.len() > 0:
         return h
@@ -20,7 +20,7 @@ def registry_host() -> str:
 
 # Fetch the list of available version strings for a package.
 # Returns an empty Vec on network or parse error.
-def registry_fetch_versions(pkg_name: str) -> Vec[str]:
+pub def registry_fetch_versions(pkg_name: str) -> Vec[str]:
     mut versions = Vec[str].init(8)
     mut host = registry_host()
     mut client = HttpClient.init(host, 443)
@@ -48,7 +48,7 @@ def registry_fetch_versions(pkg_name: str) -> Vec[str]:
 
 
 # Fetch the git clone URL for a package from the registry.
-def registry_clone_url(pkg_name: str) -> str:
+pub def registry_clone_url(pkg_name: str) -> str:
     mut host = registry_host()
     mut client = HttpClient.init(host, 443)
     mut resp = client.get("/v1/packages/" + pkg_name)
@@ -72,7 +72,7 @@ def registry_clone_url(pkg_name: str) -> str:
 
 # Search the registry for packages matching a query string.
 # Prints results to stdout (used by `taupkg search`).
-def registry_search(query: str):
+pub def registry_search(query: str):
     mut host = registry_host()
     mut client = HttpClient.init(host, 443)
     mut resp = client.get("/v1/search?q=" + query)
@@ -84,7 +84,7 @@ def registry_search(query: str):
 
 # Publish a package to the registry.
 # Requires TAUPKG_TOKEN env variable.
-def registry_publish(manifest_path: str, tarball_path: str) -> bool:
+pub def registry_publish(manifest_path: str, tarball_path: str) -> bool:
     mut token = Env.get_var("TAUPKG_TOKEN")
     if token.len() == 0:
         print("error: TAUPKG_TOKEN not set. Run `taupkg login` first.")

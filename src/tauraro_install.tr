@@ -28,7 +28,7 @@ from util import path_join, mkdir_p, taupkg_home, shell_capture
 
 # -- platform detection --------------------------------------------------------
 
-def detect_os() -> str:
+pub def detect_os() -> str:
     if OS.is_windows():
         return "windows"
     mut s = shell_capture("uname -s")
@@ -36,7 +36,7 @@ def detect_os() -> str:
         return "macos"
     return "linux"
 
-def detect_arch() -> str:
+pub def detect_arch() -> str:
     if OS.is_windows():
         mut a = Env.get_var("PROCESSOR_ARCHITECTURE")
         if a == "ARM64":
@@ -51,7 +51,7 @@ def detect_arch() -> str:
 
 # Fetch the latest release tag from the GitHub API.
 # Returns version without "v" prefix (e.g. "0.0.3"), or "" on failure.
-def fetch_latest_version() -> str:
+pub def fetch_latest_version() -> str:
     mut json = shell_capture("curl -fsSL https://api.github.com/repos/tauraro/tauraro/releases/latest")
     mut key = "\"tag_name\":"
     mut pos = json.index_of(key)
@@ -73,7 +73,7 @@ def fetch_latest_version() -> str:
 
 # curl ships on Windows 10+, macOS, and all major Linux distros.
 # -f = fail on HTTP error  -S = show errors  -L = follow redirects
-def curl_download(url: str, dest: str, verbose: bool) -> int:
+pub def curl_download(url: str, dest: str, verbose: bool) -> int:
     mut silence = "-s "
     if verbose: silence = ""
     mut cmd = "curl " + silence + "-fSL -o \"" + dest + "\" \"" + url + "\""
@@ -83,7 +83,7 @@ def curl_download(url: str, dest: str, verbose: bool) -> int:
 
 # Extract zip into dest_dir, preserving the top-level folder inside the zip.
 # After this, dest_dir/tauraroc-{os}-{arch}/ contains the binary + runtime/ + std/.
-def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
+pub def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
     if os_name == "windows":
         # tar handles zip on Windows 10+ (no extra install needed)
         mut cmd = "tar -xf \"" + zip_path + "\" -C \"" + dest_dir + "\""
@@ -107,7 +107,7 @@ def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
 
 # Windows: setx writes to the user's persistent PATH registry key.
 # The current session won't see it, but every new terminal will.
-def setup_path_windows(install_dir: str):
+pub def setup_path_windows(install_dir: str):
     # Read current user PATH from registry to avoid clobbering it
     mut cur = shell_capture("powershell -Command \"[Environment]::GetEnvironmentVariable('PATH','User')\"")
     if cur.contains(install_dir):
@@ -124,7 +124,7 @@ def setup_path_windows(install_dir: str):
         print("    " + install_dir)
 
 # Unix: append export line to shell profiles that exist, skip if already present.
-def setup_path_unix(install_dir: str):
+pub def setup_path_unix(install_dir: str):
     mut export_line = "export PATH=\"" + install_dir + ":$PATH\""
     mut marker = "# added by taupkg install-tauraro"
 
@@ -154,7 +154,7 @@ def setup_path_unix(install_dir: str):
 
 # -- main entry ----------------------------------------------------------------
 
-def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
+pub def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
     mut os_name = detect_os()
     mut arch    = detect_arch()
 

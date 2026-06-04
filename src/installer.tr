@@ -18,7 +18,7 @@ from semver import Version
 
 # Install a single package into the project's packages directory.
 # Returns a LockedPkg describing what was installed, or an empty LockedPkg on failure.
-def install_package(
+pub def install_package(
     pkg_name: str,
     constraint: str,
     source_uri: str,
@@ -92,7 +92,7 @@ def install_package(
 
 
 # Result returned by registry_resolve.
-class RegistryResult:
+pub class RegistryResult:
     pub version: str
     pub clone_url: str
     pub tag: str
@@ -108,7 +108,7 @@ extend RegistryResult:
 
 # Ask the official taupkg registry for the best matching version.
 # Returns empty RegistryResult if resolution fails.
-def registry_resolve(pkg_name: str, constraint: str) -> RegistryResult:
+pub def registry_resolve(pkg_name: str, constraint: str) -> RegistryResult:
     from registry import registry_fetch_versions, registry_clone_url
     mut versions = registry_fetch_versions(pkg_name)
     if versions.len == 0:

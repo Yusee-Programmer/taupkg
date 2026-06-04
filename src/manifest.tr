@@ -3,7 +3,7 @@
 from std.io import File
 from toml import toml_load, TomlDoc, TomlSection
 
-class Manifest:
+pub class Manifest:
     pub name: str
     pub version: str
     pub desc: str
@@ -55,7 +55,7 @@ extend Manifest:
         return m
 
 
-def find_manifest(start_dir: str) -> str:
+pub def find_manifest(start_dir: str) -> str:
     mut dir = start_dir
     mut limit = 16
     while limit > 0:

@@ -19,7 +19,7 @@ from lockfile import Lockfile, LockedPkg
 # Resolve the Tauraro compiler binary path.
 # 1. TAURARO_COMPILER env var (explicit override)
 # 2. tauraroc / tauraroc.exe on PATH
-def find_compiler() -> str:
+pub def find_compiler() -> str:
     mut env_cc = Env.get_var("TAURARO_COMPILER")
     if env_cc.len() > 0:
         return env_cc
@@ -30,7 +30,7 @@ def find_compiler() -> str:
 
 # Prepare the build sandbox.
 # Copies project src/ and all installed packages into .taupkg/build/.
-def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfile, verbose: bool) -> bool:
+pub def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfile, verbose: bool) -> bool:
     mut build_dir = project_build_dir(project_root)
     rm_rf(build_dir)
     mkdir_p(build_dir)
@@ -69,7 +69,7 @@ def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfile, v
 
 # Run the Tauraro compiler on the build sandbox.
 # Returns the compiler exit code (0 = success).
-def run_compiler(project_root: str, manifest: Manifest, output: str, release: bool, verbose: bool) -> int:
+pub def run_compiler(project_root: str, manifest: Manifest, output: str, release: bool, verbose: bool) -> int:
     mut build_dir = project_build_dir(project_root)
     mut cc = find_compiler()
 
@@ -95,7 +95,7 @@ def run_compiler(project_root: str, manifest: Manifest, output: str, release: bo
 
 
 # High-level build: prepare sandbox + compile.
-def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, verbose: bool) -> bool:
+pub def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, verbose: bool) -> bool:
     if verbose:
         print("Preparing build sandbox...")
     mut ok = prepare_sandbox(project_root, manifest, lockfile, verbose)
@@ -111,7 +111,7 @@ def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, out
 
 
 # Run the built binary (for `taupkg run`).
-def run_binary(project_root: str, manifest: Manifest, args: Vec[str]) -> int:
+pub def run_binary(project_root: str, manifest: Manifest, args: Vec[str]) -> int:
     mut bin_name = manifest.name
     if OS.is_windows():
         bin_name = bin_name + ".exe"

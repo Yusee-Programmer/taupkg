@@ -18,7 +18,7 @@
 #   clean                  Remove .taupkg/build/
 #   version                Print taupkg version
 
-class CliArgs:
+pub class CliArgs:
     pub command: str
     pub pos_args: Vec[str]   # positional arguments after the command
     pub flags: Map[str, str] # --key value or --flag (value = "true")
@@ -47,16 +47,13 @@ extend CliArgs:
         return ""
 
 
-# Parse sys.argv-style Vec[str].
-def parse_args(argv: Vec[str]) -> CliArgs:
+pub def parse_args(argv: Vec[str]) -> CliArgs:
     mut a = CliArgs.init()
     mut i = 0
 
-    # Skip program name (argv[0])
     if argv.len > 0:
         i = 1
 
-    # First non-flag arg is the command
     if i < argv.len:
         mut first = argv.get(i)
         if not first.starts_with("-"):
@@ -68,32 +65,36 @@ def parse_args(argv: Vec[str]) -> CliArgs:
         mut arg = argv.get(i)
         if arg == "--":
             past_dashdash = true
-            i = i + 1
-            continue
-        if past_dashdash:
+        elif past_dashdash:
             a.passthrough.push(arg)
-            i = i + 1
-            continue
-        if arg.starts_with("--"):
+        elif arg.starts_with("--"):
             mut key = arg.slice(2, arg.len())
-            # --key=value form
             mut eq = key.index_of("=")
             if eq >= 0:
                 mut val = key.slice(eq + 1, key.len())
                 key = key.slice(0, eq)
                 a.flags.insert(key, val)
-            # --key value form (next arg is value if it doesn't start with -)
-            elif i + 1 < argv.len and not argv.get(i + 1).starts_with("-"):
-                i = i + 1
-                a.flags.insert(key, argv.get(i))
             else:
-                a.flags.insert(key, "true")
-        elif arg.starts_with("-") and arg.len() == 2:
-            # Short flag: -o output.exe
+                mut has_next = i + 1 < argv.len
+                if has_next:
+                    mut next_a = argv.get(i + 1)
+                    if not next_a.starts_with("-"):
+                        i = i + 1
+                        a.flags.insert(key, argv.get(i))
+                    else:
+                        a.flags.insert(key, "true")
+                else:
+                    a.flags.insert(key, "true")
+        elif arg.starts_with("-"):
             mut key = arg.slice(1, 2)
-            if i + 1 < argv.len and not argv.get(i + 1).starts_with("-"):
-                i = i + 1
-                a.flags.insert(key, argv.get(i))
+            mut has_next = i + 1 < argv.len
+            if has_next:
+                mut next_a = argv.get(i + 1)
+                if not next_a.starts_with("-"):
+                    i = i + 1
+                    a.flags.insert(key, argv.get(i))
+                else:
+                    a.flags.insert(key, "true")
             else:
                 a.flags.insert(key, "true")
         else:
@@ -103,7 +104,7 @@ def parse_args(argv: Vec[str]) -> CliArgs:
     return a
 
 
-def print_usage():
+pub def print_usage():
     print("""
 taupkg -- Tauraro package manager v0.1.0
 

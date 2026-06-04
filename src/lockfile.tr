@@ -10,7 +10,7 @@
 from std.io import File
 from toml import toml_load, TomlDoc
 
-class LockedPkg:
+pub class LockedPkg:
     pub name: str
     pub version: str
     pub source: str
@@ -27,7 +27,7 @@ extend LockedPkg:
 
 
 # Renamed from LockFile to avoid clash with Windows API LockFile() function.
-class Lockfile:
+pub class Lockfile:
     pub packages: Vec[LockedPkg]
 
 extend Lockfile:
@@ -48,7 +48,7 @@ extend Lockfile:
     pub def has(self, name: str) -> bool:
         return self.find(name).name.len() > 0
 
-    pub def upsert(mut self, pkg: LockedPkg):
+    pub def upsert(self, pkg: LockedPkg):
         mut i = 0
         while i < self.packages.len:
             mut p = self.packages.get(i)
