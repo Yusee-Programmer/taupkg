@@ -1,17 +1,17 @@
-# Registry client — communicates with the taupkg package registry.
+# Registry client -- communicates with the taupkg package registry.
 #
 # Registry API (REST over HTTP):
-#   GET /v1/packages/{name}/versions  → JSON: ["1.0.0","1.1.0",...]
-#   GET /v1/packages/{name}           → JSON: {name,description,clone_url,...}
+#   GET /v1/packages/{name}/versions  -> JSON: ["1.0.0","1.1.0",...]
+#   GET /v1/packages/{name}           -> JSON: {name,description,clone_url,...}
 #
 # If the environment variable TAUPKG_REGISTRY is set, it overrides the default host.
-# Default: registry.taupkg.dev (port 443 / HTTPS — HttpClient handles TLS)
+# Default: registry.taupkg.dev (port 443 / HTTPS -- HttpClient handles TLS)
 
 from std.os import Env
 from std.net import HttpClient
 from util import shell_capture
 
-def registry_host() -> str:
+pub def registry_host() -> str:
     mut h = Env.get_var("TAUPKG_REGISTRY")
     if h.len() > 0:
         return h
@@ -20,14 +20,14 @@ def registry_host() -> str:
 
 # Fetch the list of available version strings for a package.
 # Returns an empty Vec on network or parse error.
-def registry_fetch_versions(pkg_name: str) -> Vec[str]:
+pub def registry_fetch_versions(pkg_name: str) -> Vec[str]:
     mut versions = Vec[str].init(8)
     mut host = registry_host()
     mut client = HttpClient.init(host, 443)
     mut resp = client.get("/v1/packages/" + pkg_name + "/versions")
     if resp.status != 200:
         return versions
-    # Parse JSON array ["1.0.0","1.1.0",...] — minimal hand-parser
+    # Parse JSON array ["1.0.0","1.1.0",...] -- minimal hand-parser
     mut body = resp.body.trim()
     if not body.starts_with("["):
         return versions
@@ -48,14 +48,14 @@ def registry_fetch_versions(pkg_name: str) -> Vec[str]:
 
 
 # Fetch the git clone URL for a package from the registry.
-def registry_clone_url(pkg_name: str) -> str:
+pub def registry_clone_url(pkg_name: str) -> str:
     mut host = registry_host()
     mut client = HttpClient.init(host, 443)
     mut resp = client.get("/v1/packages/" + pkg_name)
     if resp.status != 200:
         # Fallback: assume GitHub under the taupkg-packages org
         return "https://github.com/taupkg-packages/" + pkg_name + ".git"
-    # Extract "clone_url":"..." from JSON — simple search
+    # Extract "clone_url":"..." from JSON -- simple search
     mut body = resp.body
     mut key = "\"clone_url\":"
     mut pos = body.index_of(key)
@@ -72,7 +72,7 @@ def registry_clone_url(pkg_name: str) -> str:
 
 # Search the registry for packages matching a query string.
 # Prints results to stdout (used by `taupkg search`).
-def registry_search(query: str):
+pub def registry_search(query: str):
     mut host = registry_host()
     mut client = HttpClient.init(host, 443)
     mut resp = client.get("/v1/search?q=" + query)
@@ -84,7 +84,7 @@ def registry_search(query: str):
 
 # Publish a package to the registry.
 # Requires TAUPKG_TOKEN env variable.
-def registry_publish(manifest_path: str, tarball_path: str) -> bool:
+pub def registry_publish(manifest_path: str, tarball_path: str) -> bool:
     mut token = Env.get_var("TAUPKG_TOKEN")
     if token.len() == 0:
         print("error: TAUPKG_TOKEN not set. Run `taupkg login` first.")

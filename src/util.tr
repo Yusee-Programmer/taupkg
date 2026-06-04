@@ -1,10 +1,10 @@
 # Filesystem and OS utilities for taupkg.
 
 from std.io import File
-from std.os import OS, Process
+from std.os import OS, Process, Env
 
 # Join two path segments with the platform separator.
-def path_join(a: str, b: str) -> str:
+pub def path_join(a: str, b: str) -> str:
     if a.len() == 0:
         return b
     mut last = a.char_at(a.len() - 1)
@@ -16,7 +16,7 @@ def path_join(a: str, b: str) -> str:
 
 
 # Normalize path separators to forward slashes.
-def path_normalize(p: str) -> str:
+pub def path_normalize(p: str) -> str:
     mut out = ""
     mut i = 0
     while i < p.len():
@@ -30,7 +30,7 @@ def path_normalize(p: str) -> str:
 
 
 # Return the directory portion of a path (everything before the last slash).
-def path_dir(p: str) -> str:
+pub def path_dir(p: str) -> str:
     mut i = p.len() - 1
     while i > 0:
         mut c = p.char_at(i)
@@ -41,7 +41,7 @@ def path_dir(p: str) -> str:
 
 
 # Return the final component of a path.
-def path_base(p: str) -> str:
+pub def path_base(p: str) -> str:
     mut i = p.len() - 1
     while i > 0:
         mut c = p.char_at(i)
@@ -52,7 +52,7 @@ def path_base(p: str) -> str:
 
 
 # Create a directory and all parents (like mkdir -p).
-def mkdir_p(dir: str) -> bool:
+pub def mkdir_p(dir: str) -> bool:
     if File.dir_exists(dir):
         return true
     if OS.is_windows():
@@ -65,7 +65,7 @@ def mkdir_p(dir: str) -> bool:
 
 
 # Remove a directory tree recursively.
-def rm_rf(dir: str):
+pub def rm_rf(dir: str):
     if OS.is_windows():
         mut cmd = "rmdir /s /q \"" + dir + "\" 2>nul"
         Process.system(cmd)
@@ -75,7 +75,7 @@ def rm_rf(dir: str):
 
 
 # Copy a directory tree recursively.
-def cp_r(src: str, dest: str) -> bool:
+pub def cp_r(src: str, dest: str) -> bool:
     if OS.is_windows():
         mut cmd = "xcopy /e /i /q \"" + src + "\" \"" + dest + "\" >nul 2>&1"
         mut rc = Process.system(cmd)
@@ -87,12 +87,12 @@ def cp_r(src: str, dest: str) -> bool:
 
 
 # Run a shell command and return its trimmed stdout output.
-def shell_capture(cmd: str) -> str:
+pub def shell_capture(cmd: str) -> str:
     return Process.shell_output(cmd).trim()
 
 
 # Check whether a command is available on PATH.
-def cmd_exists(name: str) -> bool:
+pub def cmd_exists(name: str) -> bool:
     if OS.is_windows():
         mut out = shell_capture("where " + name + " 2>nul")
         return out.len() > 0
@@ -102,7 +102,7 @@ def cmd_exists(name: str) -> bool:
 
 
 # Return the taupkg home directory: ~/.taupkg
-def taupkg_home() -> str:
+pub def taupkg_home() -> str:
     mut home = ""
     if OS.is_windows():
         home = Env.get_var("USERPROFILE")
@@ -114,15 +114,15 @@ def taupkg_home() -> str:
 
 
 # Return the global package cache directory: ~/.taupkg/cache
-def pkg_cache_dir() -> str:
+pub def pkg_cache_dir() -> str:
     return path_join(taupkg_home(), "cache")
 
 
 # Return the packages directory relative to a project root: .taupkg/packages
-def project_pkg_dir(project_root: str) -> str:
+pub def project_pkg_dir(project_root: str) -> str:
     return path_join(project_root, ".taupkg/packages")
 
 
 # Return the build sandbox directory: .taupkg/build
-def project_build_dir(project_root: str) -> str:
+pub def project_build_dir(project_root: str) -> str:
     return path_join(project_root, ".taupkg/build")

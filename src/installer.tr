@@ -1,4 +1,4 @@
-# Installer — fetch and install packages into .taupkg/packages/<name>/.
+# Installer -- fetch and install packages into .taupkg/packages/<name>/.
 #
 # Install flow:
 #   1. Parse source URI to get kind/url/ref
@@ -18,7 +18,7 @@ from semver import Version
 
 # Install a single package into the project's packages directory.
 # Returns a LockedPkg describing what was installed, or an empty LockedPkg on failure.
-def install_package(
+pub def install_package(
     pkg_name: str,
     constraint: str,
     source_uri: str,
@@ -39,7 +39,7 @@ def install_package(
 
     if src.kind == "local":
         if verbose:
-            print("  [local] Copying " + src.uri + " → " + pkg_dir)
+            print("  [local] Copying " + src.uri + " -> " + pkg_dir)
         mut ok = cp_r(src.uri, pkg_dir)
         if not ok:
             print("error: failed to copy local package " + pkg_name + " from " + src.uri)
@@ -67,7 +67,7 @@ def install_package(
             print("error: no version of " + pkg_name + " satisfies " + constraint)
             return LockedPkg.init("", "", "", "")
         if verbose:
-            print("  [registry] " + pkg_name + "@" + reg_result.version + " → " + reg_result.clone_url)
+            print("  [registry] " + pkg_name + "@" + reg_result.version + " -> " + reg_result.clone_url)
         mut git_src = Source.init("git", reg_result.clone_url, reg_result.tag)
         mut cmd = source_clone_cmd(git_src, pkg_dir)
         mut rc = Process.system(cmd)
@@ -92,7 +92,7 @@ def install_package(
 
 
 # Result returned by registry_resolve.
-class RegistryResult:
+pub class RegistryResult:
     pub version: str
     pub clone_url: str
     pub tag: str
@@ -108,7 +108,7 @@ extend RegistryResult:
 
 # Ask the official taupkg registry for the best matching version.
 # Returns empty RegistryResult if resolution fails.
-def registry_resolve(pkg_name: str, constraint: str) -> RegistryResult:
+pub def registry_resolve(pkg_name: str, constraint: str) -> RegistryResult:
     from registry import registry_fetch_versions, registry_clone_url
     mut versions = registry_fetch_versions(pkg_name)
     if versions.len == 0:

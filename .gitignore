@@ -1,0 +1,7 @@
+*.c
+*.exe
+*.txt
+build/
+
+**/tauraro_rt.h
+**/tauraro_types.h

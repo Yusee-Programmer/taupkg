@@ -7,11 +7,11 @@
 #   key = "value"       # with inline comment
 #
 # No floats, no dates, no inline tables, no multi-line strings.
-# Returns data as string maps — the callers cast to richer types.
+# Returns data as string maps -- the callers cast to richer types.
 
 from std.io import File
 
-class TomlSection:
+pub class TomlSection:
     pub name: str
     pub keys: Map[str, str]
 
@@ -22,7 +22,7 @@ extend TomlSection:
         s.keys = Map[str, str].init(16)
         return s
 
-class TomlDoc:
+pub class TomlDoc:
     pub sections: Vec[TomlSection]
     pub array_sections: Map[str, Vec[TomlSection]]
 
@@ -55,7 +55,7 @@ extend TomlDoc:
         return ""
 
 
-def toml_strip_comment(line: str) -> str:
+pub def toml_strip_comment(line: str) -> str:
     mut i = 0
     mut in_str = false
     while i < line.len():
@@ -70,14 +70,14 @@ def toml_strip_comment(line: str) -> str:
     return line
 
 
-def toml_unquote(s: str) -> str:
+pub def toml_unquote(s: str) -> str:
     mut t = s.trim()
     if t.starts_with("\"") and t.ends_with("\"") and t.len() >= 2:
         return t.slice(1, t.len() - 1)
     return t
 
 
-def toml_parse(content: str) -> TomlDoc:
+pub def toml_parse(content: str) -> TomlDoc:
     mut doc = TomlDoc.init()
     mut cur_section = TomlSection.init("_root")
     mut cur_arr_name = ""
@@ -155,7 +155,7 @@ def toml_parse(content: str) -> TomlDoc:
     return doc
 
 
-def toml_load(path: str) -> TomlDoc:
+pub def toml_load(path: str) -> TomlDoc:
     if not File.file_exists(path):
         return TomlDoc.init()
     mut content = File.read_text(path)

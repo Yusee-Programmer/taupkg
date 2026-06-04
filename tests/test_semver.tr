@@ -7,8 +7,10 @@ def assert_eq(got: str, want: str, label: str):
         print("ok   " + label)
 
 def assert_bool(got: bool, want: bool, label: str):
-    mut gs = "true" if got else "false"
-    mut ws = "true" if want else "false"
+    mut gs = "false"
+    if got:  gs = "true"
+    mut ws = "false"
+    if want: ws = "true"
     if got != want:
         print("FAIL " + label + ": got=" + gs + " want=" + ws)
     else:
@@ -38,38 +40,38 @@ def main() -> int:
     assert_bool(a.eq(b), false, "eq false")
     assert_bool(b.gt(a), true,  "gt true")
 
-    # satisfies — wildcard
+    # satisfies -- wildcard
     assert_bool(Version.init("1.2.3").satisfies("*"), true, "wildcard *")
     assert_bool(Version.init("1.2.3").satisfies(""),  true, "wildcard empty")
 
-    # satisfies — exact
+    # satisfies -- exact
     assert_bool(Version.init("1.2.3").satisfies("1.2.3"), true,  "exact match")
     assert_bool(Version.init("1.2.4").satisfies("1.2.3"), false, "exact no-match")
 
-    # satisfies — ^
+    # satisfies -- ^
     assert_bool(Version.init("1.5.0").satisfies("^1.2.0"), true,  "caret same-major hi-minor")
     assert_bool(Version.init("2.0.0").satisfies("^1.2.0"), false, "caret next-major")
     assert_bool(Version.init("1.1.9").satisfies("^1.2.0"), false, "caret below-base")
 
-    # satisfies — ~
+    # satisfies -- ~
     assert_bool(Version.init("1.2.9").satisfies("~1.2.0"), true,  "tilde same-minor patch bump")
     assert_bool(Version.init("1.3.0").satisfies("~1.2.0"), false, "tilde next-minor")
     assert_bool(Version.init("1.2.0").satisfies("~1.2.0"), true,  "tilde exact base")
 
-    # satisfies — >=
+    # satisfies -- >=
     assert_bool(Version.init("1.3.0").satisfies(">=1.2.0"), true,  "gte above")
     assert_bool(Version.init("1.2.0").satisfies(">=1.2.0"), true,  "gte equal")
     assert_bool(Version.init("1.1.9").satisfies(">=1.2.0"), false, "gte below")
 
-    # satisfies — >
+    # satisfies -- >
     assert_bool(Version.init("1.3.0").satisfies(">1.2.0"), true,  "gt above")
     assert_bool(Version.init("1.2.0").satisfies(">1.2.0"), false, "gt equal (exclusive)")
 
-    # satisfies — <=
+    # satisfies -- <=
     assert_bool(Version.init("1.2.0").satisfies("<=1.2.0"), true,  "lte equal")
     assert_bool(Version.init("1.3.0").satisfies("<=1.2.0"), false, "lte above")
 
-    # satisfies — <
+    # satisfies -- <
     assert_bool(Version.init("1.1.9").satisfies("<1.2.0"), true,  "lt below")
     assert_bool(Version.init("1.2.0").satisfies("<1.2.0"), false, "lt equal (exclusive)")
 
