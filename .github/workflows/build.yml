@@ -65,12 +65,17 @@ jobs:
             --dir tauraroc-dl/ \
             --clobber
 
-          # Extract — preserves the tauraroc-{platform}/ subfolder structure
+          # Extract — preserves the tauraroc-{platform}/ subfolder structure.
+          # Use unzip on all platforms (available via Git Bash on Windows runners).
+          # PowerShell Expand-Archive is a reliable fallback if unzip is absent.
           mkdir -p tauraroc-install/
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            tar -xf "tauraroc-dl/$ZIP" -C tauraroc-install/
+          if unzip -oq "tauraroc-dl/$ZIP" -d tauraroc-install/ 2>/dev/null; then
+            echo "==> Extracted with unzip"
           else
-            unzip -oq "tauraroc-dl/$ZIP" -d tauraroc-install/
+            echo "==> unzip failed, trying PowerShell Expand-Archive..."
+            powershell -Command "Expand-Archive -Force \
+              -Path 'tauraroc-dl/$ZIP' \
+              -DestinationPath 'tauraroc-install/'"
           fi
 
           # Locate the binary inside the extracted folder
@@ -83,24 +88,35 @@ jobs:
 
           chmod +x "$BIN" 2>/dev/null || true
 
-          # Export as Windows-native path when on Windows runner
+          # The runtime header lives next to the binary (runtime/tauraro_rt.h).
+          # Export both the binary path and the runtime dir so the compiler finds
+          # its headers even when invoked from a different working directory.
+          BIN_DIR=$(dirname "$BIN")
+          RT_DIR="$(pwd)/$BIN_DIR/runtime"
+
+          # Export as Windows-native paths when on Windows runner
           if [ "$RUNNER_OS" = "Windows" ]; then
             TAURAROC=$(cygpath -w "$BIN")
+            TAURAROC_RT=$(cygpath -w "$RT_DIR")
           else
             TAURAROC="$(pwd)/$BIN"
+            TAURAROC_RT="$RT_DIR"
           fi
 
-          echo "TAURAROC=$TAURAROC" >> "$GITHUB_ENV"
+          echo "TAURAROC=$TAURAROC"         >> "$GITHUB_ENV"
+          echo "TAURAROC_RT=$TAURAROC_RT"   >> "$GITHUB_ENV"
           echo "Using tauraroc: $TAURAROC"
+          echo "Runtime dir:    $TAURAROC_RT"
 
       # -------------------------------------------------------
       # Compile taupkg.
-      # Entry point: src/main.tr  →  taupkg[.exe]
+      # tauraroc writes the binary to src/build/taupkg[.exe].
+      # Entry point: src/main.tr  →  src/build/taupkg[.exe]
       # -------------------------------------------------------
       - name: Build taupkg (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
-          "$TAURAROC" src/main.tr -o "taupkg"
+          "$TAURAROC" src/main.tr -o taupkg
 
       - name: Build taupkg (Windows)
         if: runner.os == 'Windows'
@@ -108,12 +124,28 @@ jobs:
         run: |
           & "$env:TAURAROC" src\main.tr -o taupkg.exe
 
+      # tauraroc puts the binary in src/build/ — move it to the repo root
+      # (same pattern as the main tauraroc CI "Place binary at repo root" step).
+      - name: Place binary at repo root
+        shell: bash
+        run: |
+          if [ -f "src/build/taupkg${{ matrix.ext }}" ]; then
+            mv "src/build/taupkg${{ matrix.ext }}" "./taupkg${{ matrix.ext }}"
+          elif [ -f "taupkg${{ matrix.ext }}" ]; then
+            echo "Binary already at repo root (compiler placed it directly)."
+          else
+            echo "error: taupkg${{ matrix.ext }} not found in src/build/ or current dir"
+            ls -la src/build/ 2>/dev/null || true
+            exit 1
+          fi
+
       - name: Verify binary
         shell: bash
         run: |
           if [ -f "taupkg${{ matrix.ext }}" ]; then
             echo "Build succeeded: taupkg${{ matrix.ext }}"
             ls -lh "taupkg${{ matrix.ext }}"
+            ./taupkg${{ matrix.ext }} version
           else
             echo "error: taupkg${{ matrix.ext }} not produced"
             exit 1
