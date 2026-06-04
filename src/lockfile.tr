@@ -1,4 +1,4 @@
-# Lock file — taupkg.lock
+# Lock file -- taupkg.lock
 #
 # Format:
 #   [pkg]
@@ -59,7 +59,7 @@ extend Lockfile:
         self.packages.push(pkg)
 
     pub def to_string(self) -> str:
-        mut out = "# taupkg lock file — do not edit manually\n\n"
+        mut out = "# taupkg lock file -- do not edit manually\n\n"
         mut i = 0
         while i < self.packages.len:
             mut p = self.packages.get(i)

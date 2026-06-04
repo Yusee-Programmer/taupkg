@@ -1,4 +1,4 @@
-# Installer — fetch and install packages into .taupkg/packages/<name>/.
+# Installer -- fetch and install packages into .taupkg/packages/<name>/.
 #
 # Install flow:
 #   1. Parse source URI to get kind/url/ref
@@ -39,7 +39,7 @@ def install_package(
 
     if src.kind == "local":
         if verbose:
-            print("  [local] Copying " + src.uri + " → " + pkg_dir)
+            print("  [local] Copying " + src.uri + " -> " + pkg_dir)
         mut ok = cp_r(src.uri, pkg_dir)
         if not ok:
             print("error: failed to copy local package " + pkg_name + " from " + src.uri)
@@ -67,7 +67,7 @@ def install_package(
             print("error: no version of " + pkg_name + " satisfies " + constraint)
             return LockedPkg.init("", "", "", "")
         if verbose:
-            print("  [registry] " + pkg_name + "@" + reg_result.version + " → " + reg_result.clone_url)
+            print("  [registry] " + pkg_name + "@" + reg_result.version + " -> " + reg_result.clone_url)
         mut git_src = Source.init("git", reg_result.clone_url, reg_result.tag)
         mut cmd = source_clone_cmd(git_src, pkg_dir)
         mut rc = Process.system(cmd)

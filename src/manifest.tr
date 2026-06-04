@@ -1,4 +1,4 @@
-# Manifest — reads and represents a taupkg.toml file.
+# Manifest -- reads and represents a taupkg.toml file.
 
 from std.io import File
 from toml import toml_load, TomlDoc, TomlSection

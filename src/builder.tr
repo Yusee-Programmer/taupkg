@@ -1,8 +1,8 @@
 # Build system integration for taupkg.
 #
 # Build sandbox layout (.taupkg/build/):
-#   src/          — copy of the project's src/ directory
-#   <pkgname>/    — installed package source (one dir per dep)
+#   src/          -- copy of the project's src/ directory
+#   <pkgname>/    -- installed package source (one dir per dep)
 #
 # Compiler invocation:
 #   tau.exe .taupkg/build/src/main.tr -o <output>
@@ -42,7 +42,7 @@ def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfile, v
         print("error: no src/ directory found in " + project_root)
         return false
     if verbose:
-        print("  copying src/ → " + src_dst)
+        print("  copying src/ -> " + src_dst)
     mut ok = cp_r(src_src, src_dst)
     if not ok:
         print("error: failed to copy src/ directory")

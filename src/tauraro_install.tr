@@ -3,21 +3,21 @@
 #
 # Zip layout (e.g. tauraroc-linux-arm64.zip):
 #   tauraroc-linux-arm64/
-#     tauraroc              ← compiler binary
+#     tauraroc              <- compiler binary
 #     runtime/
-#       tauraro_rt.h        ← needed at every compilation
-#     std/                  ← standard library .tr sources
+#       tauraro_rt.h        <- needed at every compilation
+#     std/                  <- standard library .tr sources
 #       io.tr, os.tr, ...
 #
 # The binary finds runtime/ and std/ relative to its own location, so
-# the whole extracted folder must stay together — we do NOT flatten it.
+# the whole extracted folder must stay together -- we do NOT flatten it.
 #
 # Install destination: ~/.taupkg/bin/tauraroc-{os}-{arch}/
 # PATH: that subfolder is added so `tauraroc` is directly on PATH.
 #
 # What we do NOT need from the repo:
-#   src/       — compiler source, only needed to rebuild tauraroc itself
-#   examples/  — not needed by end users
+#   src/       -- compiler source, only needed to rebuild tauraroc itself
+#   examples/  -- not needed by end users
 #
 # GitHub URL:  https://github.com/tauraro/tauraro/releases/download/v{ver}/tauraroc-{os}-{arch}.zip
 # Mirror URL:  https://tauraro.org/download/{ver}/tauraroc-{os}-{arch}.zip
@@ -26,7 +26,7 @@ from std.io import File
 from std.os import OS, Process, Env
 from util import path_join, mkdir_p, taupkg_home, shell_capture
 
-# ── platform detection ────────────────────────────────────────────────────────
+# -- platform detection --------------------------------------------------------
 
 def detect_os() -> str:
     if OS.is_windows():
@@ -47,7 +47,7 @@ def detect_arch() -> str:
         return "arm64"
     return "x64"
 
-# ── version resolution ────────────────────────────────────────────────────────
+# -- version resolution --------------------------------------------------------
 
 # Fetch the latest release tag from the GitHub API.
 # Returns version without "v" prefix (e.g. "0.0.3"), or "" on failure.
@@ -69,7 +69,7 @@ def fetch_latest_version() -> str:
         return tag.slice(1, tag.len())
     return tag
 
-# ── download ──────────────────────────────────────────────────────────────────
+# -- download ------------------------------------------------------------------
 
 # curl ships on Windows 10+, macOS, and all major Linux distros.
 # -f = fail on HTTP error  -S = show errors  -L = follow redirects
@@ -79,7 +79,7 @@ def curl_download(url: str, dest: str, verbose: bool) -> int:
     mut cmd = "curl " + silence + "-fSL -o \"" + dest + "\" \"" + url + "\""
     return Process.system(cmd)
 
-# ── extraction ────────────────────────────────────────────────────────────────
+# -- extraction ----------------------------------------------------------------
 
 # Extract zip into dest_dir, preserving the top-level folder inside the zip.
 # After this, dest_dir/tauraroc-{os}-{arch}/ contains the binary + runtime/ + std/.
@@ -103,7 +103,7 @@ def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
             rc = Process.system(cmd)
         return rc
 
-# ── PATH setup ────────────────────────────────────────────────────────────────
+# -- PATH setup ----------------------------------------------------------------
 
 # Windows: setx writes to the user's persistent PATH registry key.
 # The current session won't see it, but every new terminal will.
@@ -152,7 +152,7 @@ def setup_path_unix(install_dir: str):
     else:
         print("  Restart your terminal or run:  source ~/.profile")
 
-# ── main entry ────────────────────────────────────────────────────────────────
+# -- main entry ----------------------------------------------------------------
 
 def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
     mut os_name = detect_os()
@@ -211,7 +211,7 @@ def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
             print("       Check that version " + ver + " exists for " + os_name + "-" + arch + ".")
             return 1
 
-    # Extract — zip contains tauraroc-{os}-{arch}/ as top-level folder
+    # Extract -- zip contains tauraroc-{os}-{arch}/ as top-level folder
     if verbose:
         print("  Extracting to " + bin_root + "/")
     mut ex_rc = extract_zip(zip_path, bin_root, os_name)
@@ -242,7 +242,7 @@ def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
     if check.len() > 0:
         print("  OK: " + check)
     elif verbose:
-        print("  (could not verify binary — it may still work)")
+        print("  (could not verify binary -- it may still work)")
 
     print("")
     print("Installed:")

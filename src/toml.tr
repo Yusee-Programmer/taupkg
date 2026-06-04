@@ -7,7 +7,7 @@
 #   key = "value"       # with inline comment
 #
 # No floats, no dates, no inline tables, no multi-line strings.
-# Returns data as string maps — the callers cast to richer types.
+# Returns data as string maps -- the callers cast to richer types.
 
 from std.io import File
 
