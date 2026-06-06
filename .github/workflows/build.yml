@@ -109,76 +109,16 @@ jobs:
           echo "Runtime dir:    $TAURAROC_RT"
 
       # -------------------------------------------------------
-      # Emit C from taupkg source, then compile with GCC.
-      #
-      # Two-step approach (instead of letting tauraroc run GCC
-      # internally) because tauraroc on CI cannot locate its own
-      # runtime header relative to its install path, so its
-      # internal GCC invocation always fails with:
-      #   tauraro_rt.h: No such file or directory
-      # Additionally, on Linux tauraroc returns exit 0 even when
-      # GCC fails, making silent build failures hard to detect.
-      #
-      # We fix both by:
-      #   1. tauraroc emits C only  (--emit c)
-      #   2. we copy tauraro_rt.h   (from TAURAROC_RT we exported)
-      #   3. we run GCC ourselves   (explicit file list, strict exit)
+      # Build directly: v0.0.5 tauraroc finds its own runtime
+      # header and std/ relative to the install dir, and invokes
+      # the C compiler itself. A bare `-o name` places the binary
+      # in the CWD (repo root). No --emit c / manual GCC needed.
       # -------------------------------------------------------
-      - name: Emit C from taupkg source
+      - name: Build taupkg
         shell: bash
         run: |
-          "$TAURAROC" src/main.tr --emit c
-          echo "C files emitted to src/build/"
-          ls src/build/*.c src/build/tauraro_types.h 2>/dev/null | head -20
-
-      - name: Copy runtime header into build dir
-        shell: bash
-        run: |
-          RT="$TAURAROC_RT/tauraro_rt.h"
-          if [ ! -f "$RT" ]; then
-            # Fallback: search around the binary directory
-            RT=$(find "$(dirname "$TAURAROC")" -name "tauraro_rt.h" 2>/dev/null | head -1)
-          fi
-          if [ -z "$RT" ] || [ ! -f "$RT" ]; then
-            echo "error: tauraro_rt.h not found (TAURAROC_RT=$TAURAROC_RT)"
-            exit 1
-          fi
-          cp "$RT" src/build/tauraro_rt.h
-          echo "Copied: $RT -> src/build/tauraro_rt.h"
-
-      - name: Compile with GCC (Linux / macOS)
-        if: runner.os != 'Windows'
-        run: |
-          set -e
-          cd src
-          gcc -O2 -std=c11 -Wno-misleading-indentation -Ibuild \
-            build/main.c build/module_*.c \
-            build/include/std/core/*.c \
-            build/include/std/io/*.c build/include/std/io.c \
-            build/include/std/net/*.c build/include/std/net.c \
-            build/include/std/string/*.c \
-            -o build/taupkg -lm
-          echo "Compiled: src/build/taupkg"
-
-      - name: Compile with GCC (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -e
-          cd src
-          gcc -O2 -std=c11 -Wno-misleading-indentation -Ibuild \
-            build/main.c build/module_*.c \
-            build/include/std/core/*.c \
-            build/include/std/io/*.c build/include/std/io.c \
-            build/include/std/net/*.c build/include/std/net.c \
-            build/include/std/string/*.c \
-            -o build/taupkg.exe -lm -lws2_32
-          echo "Compiled: src/build/taupkg.exe"
-
-      - name: Place binary at repo root
-        shell: bash
-        run: |
-          mv "src/build/taupkg${{ matrix.ext }}" "./taupkg${{ matrix.ext }}"
+          "$TAURAROC" src/main.tr -o "taupkg${{ matrix.ext }}"
+          echo "Built: taupkg${{ matrix.ext }}"
 
       - name: Verify binary
         shell: bash
