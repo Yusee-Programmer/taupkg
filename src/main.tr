@@ -39,7 +39,7 @@ def main(argv: Vec[str]):
 
     # All remaining commands need a project root with taupkg.toml
     mut cwd = OS.cwd()
-    project_root = find_project_root(cwd)
+    mut project_root = find_project_root(cwd)
     mut manifest_path = path_join(project_root, "taupkg.toml")
     if not File.file_exists(manifest_path):
         print("error: no taupkg.toml found. Run `taupkg init` first.")
