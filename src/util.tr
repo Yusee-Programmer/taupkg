@@ -1,6 +1,6 @@
 # Filesystem and OS utilities for taupkg.
 
-from std.io import File
+from std.io import File, Dir
 from std.os import OS, Process, Env
 
 # Join two path segments with the platform separator.
@@ -72,6 +72,48 @@ pub def rm_rf(dir: str):
     else:
         mut cmd = "rm -rf \"" + dir + "\""
         Process.system(cmd)
+
+
+# Remove a single file.
+pub def rm_f(path: str):
+    if OS.is_windows():
+        mut cmd = "del /q \"" + path + "\" 2>nul"
+        Process.system(cmd)
+    else:
+        mut cmd = "rm -f \"" + path + "\""
+        Process.system(cmd)
+
+
+# Move/rename a file or directory.
+pub def mv(src: str, dest: str) -> bool:
+    if OS.is_windows():
+        mut cmd = "move /y \"" + src + "\" \"" + dest + "\" >nul 2>&1"
+        return Process.system(cmd) == 0
+    else:
+        mut cmd = "mv \"" + src + "\" \"" + dest + "\""
+        return Process.system(cmd) == 0
+
+
+# GitHub source archives and release tarballs extract into a single
+# top-level directory (e.g. "repo-1.2.3/"). If `dir` contains exactly one
+# entry and that entry is a directory, hoist its contents up into `dir`
+# and remove the now-empty wrapper.
+pub def flatten_single_subdir(dir: str):
+    mut entries = Dir.init(dir).list()
+    if entries.len != 1:
+        return
+    mut only = path_join(dir, entries.get(0))
+    if not File.dir_exists(only):
+        return
+    mut tmp = dir + "__flatten_tmp"
+    if not mv(only, tmp):
+        return
+    mut inner = Dir.init(tmp).list()
+    mut i = 0
+    while i < inner.len:
+        mv(path_join(tmp, inner.get(i)), path_join(dir, inner.get(i)))
+        i = i + 1
+    rm_rf(tmp)
 
 
 # Copy a directory tree recursively.

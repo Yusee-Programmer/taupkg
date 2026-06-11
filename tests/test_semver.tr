@@ -1,6 +1,6 @@
 from src.semver import Version
 
-def assert_eq(got: str, want: str, label: str):
+def check_eq(got: str, want: str, label: str):
     if got != want:
         print("FAIL " + label + ": got=" + got + " want=" + want)
     else:
@@ -19,16 +19,16 @@ def assert_bool(got: bool, want: bool, label: str):
 def main() -> int:
     # Parse
     mut v = Version.init("1.2.3")
-    assert_eq(str(v.major), "1", "parse major")
-    assert_eq(str(v.minor), "2", "parse minor")
-    assert_eq(str(v.patch), "3", "parse patch")
+    check_eq(str(v.major), "1", "parse major")
+    check_eq(str(v.minor), "2", "parse minor")
+    check_eq(str(v.patch), "3", "parse patch")
 
     mut vv = Version.init("v0.10.0")
-    assert_eq(str(vv.major), "0", "parse v-prefix major")
-    assert_eq(str(vv.minor), "10", "parse v-prefix minor")
+    check_eq(str(vv.major), "0", "parse v-prefix major")
+    check_eq(str(vv.minor), "10", "parse v-prefix minor")
 
     # to_string
-    assert_eq(v.to_string(), "1.2.3", "to_string")
+    check_eq(v.to_string(), "1.2.3", "to_string")
 
     # compare
     mut a = Version.init("1.0.0")
@@ -81,10 +81,10 @@ def main() -> int:
     versions.push("1.1.0")
     versions.push("1.2.0")
     versions.push("2.0.0")
-    assert_eq(Version.best_match(versions, "^1.0.0"), "1.2.0", "best_match caret")
-    assert_eq(Version.best_match(versions, "~1.1.0"), "1.1.0", "best_match tilde")
-    assert_eq(Version.best_match(versions, ">=2.0.0"), "2.0.0", "best_match gte exact")
-    assert_eq(Version.best_match(versions, ">2.0.0"),  "",      "best_match none satisfies")
+    check_eq(Version.best_match(versions, "^1.0.0"), "1.2.0", "best_match caret")
+    check_eq(Version.best_match(versions, "~1.1.0"), "1.1.0", "best_match tilde")
+    check_eq(Version.best_match(versions, ">=2.0.0"), "2.0.0", "best_match gte exact")
+    check_eq(Version.best_match(versions, ">2.0.0"),  "",      "best_match none satisfies")
 
     print("semver tests done")
     return 0
