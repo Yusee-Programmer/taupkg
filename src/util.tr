@@ -117,15 +117,29 @@ pub def flatten_single_subdir(dir: str):
 
 
 # Copy a directory tree recursively.
+#
+# Excludes .taupkg/, .git/, build/ and target/ from the copy. This matters for
+# local: deps whose project root contains its own example/app nested inside it
+# (e.g. watax/example/app) -- without the exclusion, copying watax/ into
+# watax/example/app/.taupkg/packages/watax/ is a cyclic copy (dest is inside
+# src) and xcopy/cp both fail.
 pub def cp_r(src: str, dest: str) -> bool:
     if OS.is_windows():
-        mut cmd = "xcopy /e /i /q \"" + src + "\" \"" + dest + "\" >nul 2>&1"
+        # robocopy exit codes 0-7 are success (various "files copied" flags);
+        # 8+ indicates failure. /XD excludes directories anywhere in the tree.
+        mut cmd = "robocopy \"" + src + "\" \"" + dest + "\" /e /XD .taupkg .git build target /NFL /NDL /NJH /NJS /NC /NS /NP >nul 2>&1"
         mut rc = Process.system(cmd)
-        return rc == 0
+        return rc < 8
     else:
-        mut cmd = "cp -r \"" + src + "\" \"" + dest + "\""
-        mut rc = Process.system(cmd)
-        return rc == 0
+        if cmd_exists("rsync"):
+            mkdir_p(dest)
+            mut cmd = "rsync -a --exclude='.taupkg' --exclude='.git' --exclude='build' --exclude='target' \"" + src + "/\" \"" + dest + "/\""
+            mut rc = Process.system(cmd)
+            return rc == 0
+        else:
+            mut cmd = "cp -r \"" + src + "\" \"" + dest + "\""
+            mut rc = Process.system(cmd)
+            return rc == 0
 
 
 # Run a shell command and return its trimmed stdout output.
