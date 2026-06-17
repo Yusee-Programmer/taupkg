@@ -1,0 +1,64 @@
+from src.source import parse_source
+
+def check_eq(got: str, want: str, label: str):
+    if got != want:
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+    else:
+        print("ok   " + label)
+
+def main() -> int:
+    # github: shorthand (existing forms)
+    mut a = parse_source("foo", "github:user/repo")
+    check_eq(a.kind, "github", "github: kind")
+    check_eq(a.uri, "https://github.com/user/repo.git", "github: uri")
+    check_eq(a.ref, "", "github: ref")
+
+    mut b = parse_source("foo", "github:user/repo@v1.2.3")
+    check_eq(b.ref, "v1.2.3", "github: ref pinned")
+
+    # bare https://github.com/user/repo
+    mut c = parse_source("foo", "https://github.com/Yusee-Programmer/templa")
+    check_eq(c.kind, "github", "bare url kind")
+    check_eq(c.uri, "https://github.com/Yusee-Programmer/templa.git", "bare url uri")
+    check_eq(c.ref, "", "bare url ref")
+
+    # bare https with .git suffix and trailing slash
+    mut d = parse_source("foo", "https://github.com/Yusee-Programmer/templa.git/")
+    check_eq(d.uri, "https://github.com/Yusee-Programmer/templa.git", "bare url .git/ uri")
+
+    # bare https with /tree/<ref>
+    mut e = parse_source("foo", "https://github.com/Yusee-Programmer/templa/tree/main")
+    check_eq(e.uri, "https://github.com/Yusee-Programmer/templa.git", "tree-ref uri")
+    check_eq(e.ref, "main", "tree-ref ref")
+
+    # bare https with @ref
+    mut f = parse_source("foo", "https://github.com/Yusee-Programmer/templa@v0.1.0")
+    check_eq(f.uri, "https://github.com/Yusee-Programmer/templa.git", "@ref uri")
+    check_eq(f.ref, "v0.1.0", "@ref ref")
+
+    # GitHub source archive (zip)
+    mut g = parse_source("foo", "https://github.com/user/repo/archive/refs/tags/v1.0.0.zip")
+    check_eq(g.kind, "archive", "archive kind (source zip)")
+    check_eq(g.uri, "https://github.com/user/repo/archive/refs/tags/v1.0.0.zip", "archive uri (source zip)")
+
+    # GitHub release asset (tar.gz)
+    mut h = parse_source("foo", "https://github.com/user/repo/releases/download/v1.0.0/asset.tar.gz")
+    check_eq(h.kind, "archive", "archive kind (release asset)")
+
+    # archive: round-trip form
+    mut i_src = parse_source("foo", "archive:https://example.com/pkg.tar.gz")
+    check_eq(i_src.kind, "archive", "archive: prefix kind")
+    check_eq(i_src.uri, "https://example.com/pkg.tar.gz", "archive: prefix uri")
+    check_eq(i_src.to_string(), "archive:https://example.com/pkg.tar.gz", "archive to_string round-trip")
+
+    # local: still works
+    mut j = parse_source("foo", "local:./vendor/foo")
+    check_eq(j.kind, "local", "local kind")
+    check_eq(j.uri, "./vendor/foo", "local uri")
+
+    # plain version constraint -> registry
+    mut k = parse_source("foo", "^1.2.0")
+    check_eq(k.kind, "registry", "registry kind")
+    check_eq(k.ref, "^1.2.0", "registry constraint")
+
+    return 0

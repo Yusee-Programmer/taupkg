@@ -7,6 +7,14 @@
 #   local:./relative/path        -> local directory (symlinked/copied)
 #   local:/absolute/path         -> absolute local directory
 #   registry:name@constraint     -> (default) look up in official registry
+#
+#   https://github.com/user/repo            -> plain GitHub repo URL (git clone)
+#   https://github.com/user/repo.git        -> same, with explicit .git
+#   https://github.com/user/repo/tree/<ref> -> GitHub repo URL pinned to a branch/tag
+#   https://github.com/user/repo@<ref>      -> same, '@' form
+#   https://.../archive/refs/tags/v1.zip    -> GitHub source archive (download + extract)
+#   https://.../releases/download/v1/x.tar.gz -> GitHub release asset (download + extract)
+#   archive:https://...                     -> explicit archive download (round-trip form)
 
 pub class Source:
     pub kind: str      # "github" | "git" | "local" | "registry"
@@ -22,6 +30,8 @@ extend Source:
         return s
 
     pub def to_string(self) -> str:
+        if self.kind == "archive":
+            return "archive:" + self.uri
         if self.ref.len() > 0:
             return self.kind + ":" + self.uri + "@" + self.ref
         return self.kind + ":" + self.uri
@@ -31,6 +41,37 @@ extend Source:
 # Plain version constraints like "^1.2.0" are returned as registry sources.
 pub def parse_source(pkg_name: str, raw: str) -> Source:
     mut s = raw.trim()
+
+    if s.starts_with("archive:"):
+        return Source.init("archive", s.slice(8, s.len()), "")
+
+    # Bare GitHub/HTTP URLs (not wrapped in github:/git: prefixes).
+    if s.starts_with("https://") or s.starts_with("http://"):
+        # GitHub source archives and release assets are downloaded and
+        # extracted directly, not git-cloned.
+        if s.contains("/releases/download/") or s.contains("/archive/") or s.ends_with(".tar.gz") or s.ends_with(".tgz") or s.ends_with(".zip"):
+            return Source.init("archive", s, "")
+
+        if s.contains("github.com/"):
+            mut rest = s.slice(s.index_of("github.com/") + 11, s.len())
+            mut ref = ""
+            mut tree_pos = rest.index_of("/tree/")
+            if tree_pos >= 0:
+                ref  = rest.slice(tree_pos + 6, rest.len())
+                rest = rest.slice(0, tree_pos)
+            else:
+                mut at_pos = rest.index_of("@")
+                if at_pos >= 0:
+                    ref  = rest.slice(at_pos + 1, rest.len())
+                    rest = rest.slice(0, at_pos)
+            while rest.len() > 0 and rest.ends_with("/"):
+                rest = rest.slice(0, rest.len() - 1)
+            if rest.ends_with(".git"):
+                rest = rest.slice(0, rest.len() - 4)
+            return Source.init("github", "https://github.com/" + rest + ".git", ref)
+
+        # Arbitrary git-hosting URL (not GitHub).
+        return Source.init("git", s, "")
 
     if s.starts_with("github:"):
         mut rest = s.slice(7, s.len())

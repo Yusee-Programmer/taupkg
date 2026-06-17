@@ -132,11 +132,32 @@ jobs:
             exit 1
           fi
 
+      # -------------------------------------------------------
+      # SHA256 checksum of the binary for this platform. Bundled
+      # alongside the binary in the main artifact AND uploaded as its
+      # own artifact so it can be downloaded standalone and pasted
+      # into the release notes.
+      # -------------------------------------------------------
+      - name: Generate SHA256 checksum
+        shell: bash
+        run: |
+          sha256sum "taupkg${{ matrix.ext }}" > "taupkg-${{ matrix.platform }}.sha256"
+          cat "taupkg-${{ matrix.platform }}.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: taupkg-${{ matrix.platform }}
-          path: taupkg${{ matrix.ext }}
+          path: |
+            taupkg${{ matrix.ext }}
+            taupkg-${{ matrix.platform }}.sha256
+
+      - name: Upload SHA256 checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taupkg-${{ matrix.platform }}-sha256
+          if-no-files-found: error
+          path: taupkg-${{ matrix.platform }}.sha256
 
   # -----------------------------------------------------------------
   # Release: runs only on v* tag pushes after all builds succeed.
@@ -182,6 +203,24 @@ jobs:
           zip -j release/assets/taupkg-windows-x64.zip release/windows-x64/taupkg.exe
           zip -j release/assets/taupkg-macos-arm64.zip release/macos-arm64/taupkg
 
+      # -------------------------------------------------------
+      # Combined SHA256SUMS.txt: checksums of the release zips
+      # (what users actually download) plus the raw per-platform
+      # binary checksums produced during the build job.
+      # -------------------------------------------------------
+      - name: Generate combined SHA256SUMS.txt
+        run: |
+          cd release/assets
+          sha256sum *.zip > SHA256SUMS.txt
+          cd -
+          echo "" >> release/assets/SHA256SUMS.txt
+          echo "# Per-platform binary checksums (uncompressed):" >> release/assets/SHA256SUMS.txt
+          cat release/linux-x64/taupkg-linux-x64.sha256     >> release/assets/SHA256SUMS.txt
+          cat release/linux-arm64/taupkg-linux-arm64.sha256 >> release/assets/SHA256SUMS.txt
+          cat release/windows-x64/taupkg-windows-x64.sha256 >> release/assets/SHA256SUMS.txt
+          cat release/macos-arm64/taupkg-macos-arm64.sha256 >> release/assets/SHA256SUMS.txt
+          cat release/assets/SHA256SUMS.txt
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -192,4 +231,5 @@ jobs:
             release/assets/taupkg-linux-x64.zip \
             release/assets/taupkg-linux-arm64.zip \
             release/assets/taupkg-windows-x64.zip \
-            release/assets/taupkg-macos-arm64.zip
+            release/assets/taupkg-macos-arm64.zip \
+            release/assets/SHA256SUMS.txt

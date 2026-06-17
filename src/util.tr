@@ -1,6 +1,6 @@
 # Filesystem and OS utilities for taupkg.
 
-from std.io import File
+from std.io import File, Dir
 from std.os import OS, Process, Env
 
 # Join two path segments with the platform separator.
@@ -74,16 +74,72 @@ pub def rm_rf(dir: str):
         Process.system(cmd)
 
 
+# Remove a single file.
+pub def rm_f(path: str):
+    if OS.is_windows():
+        mut cmd = "del /q \"" + path + "\" 2>nul"
+        Process.system(cmd)
+    else:
+        mut cmd = "rm -f \"" + path + "\""
+        Process.system(cmd)
+
+
+# Move/rename a file or directory.
+pub def mv(src: str, dest: str) -> bool:
+    if OS.is_windows():
+        mut cmd = "move /y \"" + src + "\" \"" + dest + "\" >nul 2>&1"
+        return Process.system(cmd) == 0
+    else:
+        mut cmd = "mv \"" + src + "\" \"" + dest + "\""
+        return Process.system(cmd) == 0
+
+
+# GitHub source archives and release tarballs extract into a single
+# top-level directory (e.g. "repo-1.2.3/"). If `dir` contains exactly one
+# entry and that entry is a directory, hoist its contents up into `dir`
+# and remove the now-empty wrapper.
+pub def flatten_single_subdir(dir: str):
+    mut entries = Dir.init(dir).list()
+    if entries.len != 1:
+        return
+    mut only = path_join(dir, entries.get(0))
+    if not File.dir_exists(only):
+        return
+    mut tmp = dir + "__flatten_tmp"
+    if not mv(only, tmp):
+        return
+    mut inner = Dir.init(tmp).list()
+    mut i = 0
+    while i < inner.len:
+        mv(path_join(tmp, inner.get(i)), path_join(dir, inner.get(i)))
+        i = i + 1
+    rm_rf(tmp)
+
+
 # Copy a directory tree recursively.
+#
+# Excludes .taupkg/, .git/, build/ and target/ from the copy. This matters for
+# local: deps whose project root contains its own example/app nested inside it
+# (e.g. watax/example/app) -- without the exclusion, copying watax/ into
+# watax/example/app/.taupkg/packages/watax/ is a cyclic copy (dest is inside
+# src) and xcopy/cp both fail.
 pub def cp_r(src: str, dest: str) -> bool:
     if OS.is_windows():
-        mut cmd = "xcopy /e /i /q \"" + src + "\" \"" + dest + "\" >nul 2>&1"
+        # robocopy exit codes 0-7 are success (various "files copied" flags);
+        # 8+ indicates failure. /XD excludes directories anywhere in the tree.
+        mut cmd = "robocopy \"" + src + "\" \"" + dest + "\" /e /XD .taupkg .git build target /NFL /NDL /NJH /NJS /NC /NS /NP >nul 2>&1"
         mut rc = Process.system(cmd)
-        return rc == 0
+        return rc < 8
     else:
-        mut cmd = "cp -r \"" + src + "\" \"" + dest + "\""
-        mut rc = Process.system(cmd)
-        return rc == 0
+        if cmd_exists("rsync"):
+            mkdir_p(dest)
+            mut cmd = "rsync -a --exclude='.taupkg' --exclude='.git' --exclude='build' --exclude='target' \"" + src + "/\" \"" + dest + "/\""
+            mut rc = Process.system(cmd)
+            return rc == 0
+        else:
+            mut cmd = "cp -r \"" + src + "\" \"" + dest + "\""
+            mut rc = Process.system(cmd)
+            return rc == 0
 
 
 # Run a shell command and return its trimmed stdout output.

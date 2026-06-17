@@ -1,7 +1,7 @@
 # Lock file -- taupkg.lock
 #
 # Format:
-#   [pkg]
+#   [[pkg]]
 #   name     = "pkgname"
 #   version  = "1.2.3"
 #   source   = "github:user/repo@v1.2.3"
@@ -63,7 +63,7 @@ extend Lockfile:
         mut i = 0
         while i < self.packages.len:
             mut p = self.packages.get(i)
-            out = out + "[pkg]\n"
+            out = out + "[[pkg]]\n"
             out = out + "name     = \"" + p.name     + "\"\n"
             out = out + "version  = \"" + p.version  + "\"\n"
             out = out + "source   = \"" + p.source   + "\"\n"

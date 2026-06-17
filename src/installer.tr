@@ -10,11 +10,12 @@
 
 from std.io import File
 from std.os import OS, Process
-from util import path_join, mkdir_p, rm_rf, cp_r, shell_capture, project_pkg_dir
+from util import path_join, mkdir_p, rm_rf, rm_f, cp_r, flatten_single_subdir, shell_capture, project_pkg_dir
 from source import Source, parse_source, source_clone_cmd
 from manifest import Manifest
 from lockfile import LockedPkg
 from semver import Version
+from crypto.hash import Hash
 
 # Install a single package into the project's packages directory.
 # Returns a LockedPkg describing what was installed, or an empty LockedPkg on failure.
@@ -55,6 +56,36 @@ pub def install_package(
         if rc != 0:
             print("error: git clone failed for " + pkg_name)
             return LockedPkg.init("", "", "", "")
+        mut mf = Manifest.load(path_join(pkg_dir, "taupkg.toml"))
+        installed_version = mf.version
+        if installed_version.len() == 0:
+            installed_version = src.ref
+
+    elif src.kind == "archive":
+        mkdir_p(pkg_dir)
+        mut tmp_file = path_join(project_pkg_dir(project_root), "_" + pkg_name + "_download")
+        if src.uri.ends_with(".zip"):
+            tmp_file = tmp_file + ".zip"
+        elif src.uri.ends_with(".tgz"):
+            tmp_file = tmp_file + ".tgz"
+        else:
+            tmp_file = tmp_file + ".tar.gz"
+        if verbose:
+            print("  [archive] downloading " + src.uri)
+        mut dl_cmd = "curl -fsSL -o \"" + tmp_file + "\" \"" + src.uri + "\""
+        mut rc = Process.system(dl_cmd)
+        if rc != 0:
+            print("error: failed to download " + src.uri)
+            return LockedPkg.init("", "", "", "")
+        if verbose:
+            print("  [archive] extracting -> " + pkg_dir)
+        mut ex_cmd = "tar -xf \"" + tmp_file + "\" -C \"" + pkg_dir + "\""
+        rc = Process.system(ex_cmd)
+        rm_f(tmp_file)
+        if rc != 0:
+            print("error: failed to extract " + src.uri)
+            return LockedPkg.init("", "", "", "")
+        flatten_single_subdir(pkg_dir)
         mut mf = Manifest.load(path_join(pkg_dir, "taupkg.toml"))
         installed_version = mf.version
         if installed_version.len() == 0:
