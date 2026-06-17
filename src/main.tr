@@ -4,7 +4,7 @@
 from std.io import File
 from std.os import OS, Process, Env
 from cli import parse_args, print_usage, CliArgs
-from manifest import Manifest, find_manifest
+from manifest import Manifest
 from lockfile import Lockfile, LockedPkg
 from semver import Version
 from source import parse_source
@@ -39,14 +39,12 @@ def main(argv: Vec[str]):
 
     # All remaining commands need a project root with taupkg.toml
     mut cwd = OS.cwd()
-    mut manifest_path = find_manifest(cwd)
-    if manifest_path.len() == 0:
-        manifest_path = path_join(cwd, "taupkg.toml")
-        if not File.file_exists(manifest_path):
-            print("error: no taupkg.toml found. Run `taupkg init` first.")
-            return 1
+    mut project_root = find_project_root(cwd)
+    mut manifest_path = path_join(project_root, "taupkg.toml")
+    if not File.file_exists(manifest_path):
+        print("error: no taupkg.toml found. Run `taupkg init` first.")
+        return 1
 
-    mut project_root = path_join(manifest_path, "..")
     mut manifest = Manifest.load(manifest_path)
     if not manifest.is_valid():
         print("error: invalid taupkg.toml -- 'name' and 'version' are required")
@@ -420,6 +418,27 @@ def cmd_publish(manifest: Manifest, manifest_path: str, project_root: str, verbo
 
 
 # -- internal helpers -----------------------------------------------------------
+
+
+# Finds the project root directory
+pub def find_project_root(start_dir: str) -> str:
+    mut dir = start_dir
+    mut limit = 16
+    while limit > 0:
+        mut candidate = dir + "/taupkg.toml"
+        if File.file_exists(candidate):
+            return dir
+        mut pos = dir.len() - 1
+        while pos > 0:
+            mut c = dir.char_at(pos)
+            if c == 47 or c == 92:
+                break
+            pos = pos - 1
+        if pos <= 0:
+            return ""
+        dir = dir.slice(0, pos)
+        limit = limit - 1
+    return ""
 
 # Re-parse the manifest TOML to get dep names as a Vec[str].
 # This exists because Map has no key-iteration; we parse the raw file.

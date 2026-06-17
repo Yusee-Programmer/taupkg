@@ -53,23 +53,3 @@ extend Manifest:
         m.sources      = src_sec.keys
 
         return m
-
-
-pub def find_manifest(start_dir: str) -> str:
-    mut dir = start_dir
-    mut limit = 16
-    while limit > 0:
-        mut candidate = dir + "/taupkg.toml"
-        if File.file_exists(candidate):
-            return candidate
-        mut pos = dir.len() - 1
-        while pos > 0:
-            mut c = dir.char_at(pos)
-            if c == 47 or c == 92:
-                break
-            pos = pos - 1
-        if pos <= 0:
-            return ""
-        dir = dir.slice(0, pos)
-        limit = limit - 1
-    return ""
