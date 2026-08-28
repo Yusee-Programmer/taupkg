@@ -10,14 +10,20 @@ from semver import Version
 from source import parse_source
 from installer import install_package
 from resolver import resolve, Resolution, ResolvedDep
-from builder import build_project, run_binary, find_compiler
+from builder import build_project, run_binary, find_compiler, tauraro_path_value, apply_tauraro_path
 from registry import registry_search
 from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf, credentials_path, taupkg_home, hash_tree
 from tauraro_install import install_tauraro
+from bindgen_cmd import cmd_bindgen
 
 def main(argv: Vec[str]):
     mut args = parse_args(argv)
     mut verbose = args.flag("verbose") or args.flag("v")
+
+    # `bindgen` is dispatched first: it parses its own raw argv (so `-h cpp` for
+    # C++ mode is not mistaken for `-h` help) and needs no project taupkg.toml.
+    if args.command == "bindgen":
+        return cmd_bindgen(argv, OS.cwd(), verbose)
 
     if args.command == "" or args.command == "help" or args.flag("help") or args.flag("h"):
         print_usage()
@@ -83,6 +89,9 @@ def main(argv: Vec[str]):
         if rc != 0:
             return rc
         return run_binary(project_root, manifest, args.passthrough)
+
+    if args.command == "env":
+        return cmd_env(manifest, lockfile, project_root)
 
     if args.command == "test":
         return cmd_test(manifest, lockfile, project_root, verbose)
@@ -289,6 +298,7 @@ def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_roo
     mut release = args.flag("release")
     mut output  = args.flag_val("o", "")
     mut target  = args.flag_val("target", "")   # zero-config cross-compile (tauraroc bundles zig cc)
+    mut sandbox = args.flag("sandbox")          # hermetic fallback: copy into .taupkg/build/
 
     # Make sure the full transitive graph is present before compiling. If a lock exists, replay it
     # (installing anything missing, verifying checksums); otherwise resolve fresh.
@@ -301,11 +311,28 @@ def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_roo
     if not has_lock and eff_lock.packages.len > 0:
         eff_lock.save(path_join(project_root, "taupkg.lock"))
 
-    mut ok = build_project(project_root, manifest, eff_lock, output, release, target, verbose)
+    mut ok = build_project(project_root, manifest, eff_lock, output, release, target, sandbox, verbose)
     if ok:
         print("Build succeeded.")
         return 0
     return 1
+
+
+# -- env ------------------------------------------------------------------------
+# Print the TAURARO_PATH line for compiling this project with `tauraroc` directly
+# (taupkg build sets it automatically; this is the manual escape hatch). Shell-
+# appropriate so it can be eval'd: `eval "$(taupkg env)"` on POSIX.
+def cmd_env(manifest: Manifest, lockfile: Lockfile, project_root: str) -> int:
+    mut val = tauraro_path_value(project_root, lockfile)
+    if val.len() == 0:
+        print("# taupkg: no dependencies installed — TAURARO_PATH is not needed here.")
+        return 0
+    if OS.is_windows():
+        print("set TAURARO_PATH=" + val)
+        print("# PowerShell:  $env:TAURARO_PATH = \"" + val + "\"")
+    else:
+        print("export TAURARO_PATH=\"" + val + "\"")
+    return 0
 
 
 # -- test -----------------------------------------------------------------------
@@ -316,6 +343,9 @@ def cmd_test(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose:
     if not File.dir_exists(test_dir):
         print("No tests/ directory found.")
         return 0
+
+    # Tests import the project's deps too — set TAURARO_PATH automatically.
+    apply_tauraro_path(project_root, lockfile, verbose)
 
     # Find test files: tests/test_*.tr
     mut rc = Process.system("ls \"" + test_dir + "\"")  # for now just check dir is non-empty

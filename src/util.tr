@@ -236,6 +236,24 @@ pub def shell_capture(cmd: str) -> str:
     return Process.shell_output(cmd).trim()
 
 
+# Quote a single command-line token ONLY when it needs it (contains a space, or
+# is empty). Quoting a space-free first token would trip cmd.exe's `cmd /c "a" "b"`
+# quote-stripping rule, so a bare `tauraroc.exe` must stay unquoted.
+pub def shell_quote(s: str) -> str:
+    if s.len() == 0: return "\"\""
+    if s.index_of(" ") >= 0: return "\"" + s + "\""
+    return s
+
+
+# Run a shell command robustly across platforms. On Windows the whole line is
+# wrapped in an outer quote pair so `cmd /c` strips exactly those and preserves
+# any interior quoting (the canonical fix for quoted paths on Windows).
+pub def shell_run(cmd: str) -> int:
+    if OS.is_windows():
+        return Process.system("\"" + cmd + "\"")
+    return Process.system(cmd)
+
+
 # Check whether a command is available on PATH.
 pub def cmd_exists(name: str) -> bool:
     if OS.is_windows():

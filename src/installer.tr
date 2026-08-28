@@ -10,7 +10,7 @@
 
 from std.io import File
 from std.os import OS, Process
-from util import path_join, mkdir_p, rm_rf, rm_f, cp_r, flatten_single_subdir, shell_capture, project_pkg_dir, hash_tree
+from util import path_join, mkdir_p, rm_rf, rm_f, cp_r, flatten_single_subdir, shell_capture, project_pkg_dir, hash_tree, path_resolve
 from source import Source, parse_source, source_clone_cmd
 from manifest import Manifest
 from lockfile import LockedPkg
@@ -39,14 +39,19 @@ pub def install_package(
     mut installed_source  = src.to_string()
 
     if src.kind == "local":
+        # Anchor a relative local path to project_root (absolute paths pass
+        # through). The resolver already rebases transitive deps to absolute; this
+        # also handles project-root-relative sources replayed from the lock.
+        mut local_path = path_resolve(project_root, src.uri)
         if verbose:
-            print("  [local] Copying " + src.uri + " -> " + pkg_dir)
-        mut ok = cp_r(src.uri, pkg_dir)
+            print("  [local] Copying " + local_path + " -> " + pkg_dir)
+        mut ok = cp_r(local_path, pkg_dir)
         if not ok:
-            print("error: failed to copy local package " + pkg_name + " from " + src.uri)
+            print("error: failed to copy local package " + pkg_name + " from " + local_path)
             return LockedPkg.init("", "", "", "")
         mut mf = Manifest.load(path_join(pkg_dir, "taupkg.toml"))
         installed_version = mf.version
+        installed_source  = "local:" + local_path
 
     elif src.kind == "github" or src.kind == "git":
         mut cmd = source_clone_cmd(src, pkg_dir)
