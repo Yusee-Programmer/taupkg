@@ -326,6 +326,7 @@ def _hash_tree_walk(dir: str, prefix: str, out: Vec[str]):
         i = i + 1
         if name == "." or name == "..": continue
         if name == ".git" or name == ".taupkg" or name == "build" or name == "target": continue
+        if name == "taupkg.sig": continue   # the signature file signs the hash of everything ELSE
         mut full = path_join(dir, name)
         mut rel = name
         if prefix.len() > 0: rel = prefix + "/" + name

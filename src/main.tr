@@ -15,6 +15,7 @@ from registry import registry_search
 from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf, credentials_path, taupkg_home, hash_tree, shell_quote, shell_run, path_resolve
 from security import generate_sbom, load_advisories, audit_advisories
 from features import apply_features, parse_feature_list
+from signing import key_generate, key_pubkey, sign_message, verify_message, trust_key, is_trusted, key_path, verify_package, package_signer
 from tauraro_install import install_tauraro
 from bindgen_cmd import cmd_bindgen
 
@@ -45,6 +46,15 @@ def main(argv: Vec[str]):
 
     if args.command == "search":
         return cmd_search(args)
+
+    if args.command == "key":
+        return cmd_key(args)
+
+    if args.command == "sign":
+        return cmd_sign(args)
+
+    if args.command == "verify":
+        return cmd_verify(args)
 
     # All remaining commands need a project root with taupkg.toml
     mut cwd = OS.cwd()
@@ -525,6 +535,18 @@ def cmd_publish(args: CliArgs, manifest: Manifest, manifest_path: str, project_r
         print("error: failed to create package tarball.")
         return 1
 
+    # Sign the package's content checksum with the default key, if one exists.
+    mut checksum = hash_tree(src_dir)
+    mut signer_pk = key_pubkey("default")
+    mut signature = ""
+    if signer_pk.len() > 0:
+        signature = sign_message(checksum, "default")
+        mut sigfile = path_join(project_root, ".taupkg/" + manifest.name + "-" + manifest.version + ".sig")
+        File.write_text(sigfile, "pubkey = \"" + signer_pk + "\"\nsignature = \"" + signature + "\"\nchecksum = \"" + checksum + "\"\n")
+        print("Signed with ed25519 key (public: " + signer_pk + ")")
+    else:
+        print("note: no signing key ('taupkg key gen' to create one) — publishing unsigned.")
+
     if dry:
         print("Dry run: package '" + manifest.name + " " + manifest.version + "' is valid.")
         print("  tarball: " + tarball)
@@ -660,6 +682,68 @@ def cmd_sbom(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_root
     else:
         print(doc)
     return 0
+
+
+# -- key / sign / verify (ed25519) ---------------------------------------------
+
+# `taupkg key gen|show|trust`
+def cmd_key(args: CliArgs) -> int:
+    mut sub = ""
+    if args.pos_args.len > 0: sub = args.pos_args.get(0)
+    mut name = args.flag_val("name", "default")
+
+    if sub == "gen" or sub == "generate":
+        mut pk = key_generate(name)
+        if pk.len() == 0:
+            print("error: key '" + name + "' already exists at " + key_path(name) + " (refusing to overwrite).")
+            return 1
+        print("Generated ed25519 keypair '" + name + "'.")
+        print("  private key: " + key_path(name) + "   (KEEP THIS SECRET)")
+        print("  public key:  " + pk)
+        print("Share the public key so others can `taupkg key trust " + pk + "`.")
+        return 0
+    if sub == "show" or sub == "pub":
+        mut pk = key_pubkey(name)
+        if pk.len() == 0:
+            print("error: no key '" + name + "'. Run `taupkg key gen`.")
+            return 1
+        print(pk)
+        return 0
+    if sub == "trust":
+        if args.pos_args.len < 2:
+            print("usage: taupkg key trust <pubkey> [--name <label>]")
+            return 1
+        mut pk = args.pos_args.get(1)
+        trust_key(pk, name)
+        print("Trusted public key '" + name + "': " + pk)
+        return 0
+    print("usage: taupkg key <gen|show|trust> [--name <id>]")
+    return 1
+
+# `taupkg sign <message> [--name <key>]` → print the detached signature.
+def cmd_sign(args: CliArgs) -> int:
+    if args.pos_args.len < 1:
+        print("usage: taupkg sign <message> [--name <key>]")
+        return 1
+    mut name = args.flag_val("name", "default")
+    mut sig = sign_message(args.pos_args.get(0), name)
+    if sig.len() == 0:
+        print("error: no key '" + name + "'. Run `taupkg key gen`.")
+        return 1
+    print(sig)
+    return 0
+
+# `taupkg verify <message> <signature> <pubkey>` → VALID / INVALID.
+def cmd_verify(args: CliArgs) -> int:
+    if args.pos_args.len < 3:
+        print("usage: taupkg verify <message> <signature> <pubkey>")
+        return 1
+    mut ok = verify_message(args.pos_args.get(0), args.pos_args.get(1), args.pos_args.get(2))
+    if ok:
+        print("VALID")
+        return 0
+    print("INVALID")
+    return 1
 
 
 # -- login ----------------------------------------------------------------------

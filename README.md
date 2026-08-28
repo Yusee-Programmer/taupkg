@@ -30,10 +30,12 @@ generation** from C/C++ headers.
 - **Workspaces** — a `[workspace]` root fans `install`/`build`/`test`/`tree` out
   across member packages (with inter-member path deps).
 - **Security** — content-hashed lock + `taupkg audit` (integrity **and**
-  advisory/vulnerability check) + `taupkg sbom` (CycloneDX SBOM).
+  advisory/vulnerability check) + `taupkg sbom` (CycloneDX SBOM) + **ed25519
+  package signing** (`taupkg key`/`sign`/`verify`, and signed `publish`).
 - **Real test runner** — `taupkg test` compiles and runs every `tests/*.tr`.
 - **FFI bindgen** — `taupkg bindgen` turns a C/C++ header into an importable package.
-- **New commands**: `tree`, `audit`, `sbom`, `login`, `env`, and **`bindgen`**.
+- **New commands**: `tree`, `audit`, `sbom`, `login`, `env`, `key`/`sign`/`verify`,
+  and **`bindgen`**.
 - **New flags**: `--locked`, `--offline`, `--sandbox`, `--target`, `--features`,
   `--all-features`, `--no-default-features`, `publish --dry-run`.
 
@@ -64,7 +66,8 @@ See [Dependency resolution](#dependency-resolution),
   - [update](#update) · [build](#build) · [run](#run) · [test](#test)
   - [tree](#tree) · [audit](#audit) · [sbom](#sbom) · [env](#env) · [bindgen](#bindgen)
   - [list](#list) · [info](#info) · [search](#search) · [login](#login)
-  - [publish](#publish) · [clean](#clean) · [install-tauraro](#install-tauraro)
+  - [key / sign / verify](#key--sign--verify) · [publish](#publish)
+  - [clean](#clean) · [install-tauraro](#install-tauraro)
 - [Dependency sources](#dependency-sources)
 - [Version constraints](#version-constraints)
 - [Generating FFI bindings (bindgen)](#generating-ffi-bindings-bindgen)
@@ -373,9 +376,25 @@ and offers two commands on top:
   taupkg sbom -o sbom.json
   ```
 
-> **Note on signing.** Package integrity is checksum-based (tamper-evident against
-> the lock). Cryptographic *signing* (ed25519) is not yet available — it awaits
-> asymmetric-crypto support in the Tauraro standard library.
+- **Ed25519 signing** binds a publisher identity to exact content. Generate a
+  keypair, and `taupkg publish` signs the package's content checksum; the
+  signature + public key land in `<pkg>-<ver>.sig`:
+
+  ```sh
+  taupkg key gen                    # → ~/.taupkg/keys/default.key + a public key
+  taupkg key show                   # print your public key
+  taupkg publish                    # signs automatically if a key exists
+
+  # low-level, for scripting / CI:
+  taupkg sign "some message"        # → 128-hex signature
+  taupkg verify "some message" <sig> <pubkey>   # VALID / INVALID (exit 0/1)
+
+  # trust a publisher's key so their packages can be verified:
+  taupkg key trust <pubkey> --name alice
+  ```
+
+  Signatures are ed25519 (RFC 8032) via a pure-C TweetNaCl implementation in the
+  Tauraro runtime; keys are 32-byte seeds (64-hex), signatures 64 bytes (128-hex).
 
 ---
 
@@ -625,6 +644,21 @@ taupkg login <token>
 
 Store a registry token in `~/.taupkg/credentials` for publishing. (You can also
 set `TAUPKG_TOKEN` in the environment instead.)
+
+---
+
+### key / sign / verify
+
+```sh
+taupkg key gen [--name <id>]      # generate an ed25519 keypair (default: "default")
+taupkg key show [--name <id>]     # print the public key
+taupkg key trust <pubkey> [--name <label>]   # trust a publisher's public key
+taupkg sign <message> [--name <id>]          # print a detached signature
+taupkg verify <message> <signature> <pubkey> # VALID / INVALID (exit 0/1)
+```
+
+Ed25519 (RFC 8032) signing. The private key is a 32-byte seed stored at
+`~/.taupkg/keys/<id>.key` — keep it secret. See [Security](#security).
 
 ---
 

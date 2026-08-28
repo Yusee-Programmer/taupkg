@@ -139,7 +139,10 @@ Commands:
   test                     Build and run tests (includes [dev-deps])
   search <query>           Search the registry
   login <token>            Store a registry token for publishing
-  publish [--dry-run]      Publish to the registry (--dry-run validates only)
+  key <gen|show|trust>     Manage ed25519 signing keys ([--name <id>])
+  sign <msg> [--name <k>]  Sign a message with your key (ed25519)
+  verify <msg> <sig> <pk>  Verify an ed25519 signature
+  publish [--dry-run]      Publish to the registry (signs if a key exists)
   info <pkg>               Show package information
   list                     List installed packages
   clean                    Remove .taupkg/build/
