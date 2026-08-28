@@ -1,0 +1,209 @@
+# Dependency resolver -- builds the FULL transitive dependency graph and unifies
+# every package to a single version.
+#
+# Tauraro's unity build links exactly ONE copy of each module, so — unlike Cargo,
+# which can keep multiple semver-major versions of a crate side-by-side — taupkg
+# MUST resolve each package to a single version. That makes the model simpler and
+# the guarantees stronger: the resolved graph is exactly what gets compiled, and a
+# genuine version conflict is a hard, clearly-reported error instead of a silent
+# duplicate. We always pick the HIGHEST version satisfying a constraint, so two
+# compatible constraints (`^1.0` and `^1.2`) unify automatically to the newest.
+
+from std.io import File
+from util import path_join, project_pkg_dir, path_resolve, path_relative
+from manifest import Manifest
+from lockfile import Lockfile, LockedPkg
+from semver import Version
+from source import dep_constraint, parse_source
+from installer import install_package, install_from_lock
+
+# Rebase a local `path` dependency source against `base_dir` (the directory of the
+# manifest that DECLARES it), yielding an absolute `local:<abs>` source. Non-local
+# sources (version/git/github/archive) pass through unchanged. This is what makes a
+# transitive `path = "../x"` resolve relative to its own package, not the root.
+def rebase_source(name: str, src: str, base_dir: str) -> str:
+    mut ps = parse_source(name, src)
+    if ps.kind == "local":
+        return "local:" + path_resolve(base_dir, ps.uri)
+    return src
+
+# The directory a resolved package's OWN transitive deps are anchored to: for a
+# local dep it's the package's real source dir; for a fetched dep (git/archive/
+# registry) it's the checkout under .taupkg/packages/<name>/.
+def origin_dir_of(name: str, src: str, project_root: str) -> str:
+    mut ps = parse_source(name, src)
+    if ps.kind == "local":
+        return ps.uri   # already absolute after rebase_source
+    return path_join(project_pkg_dir(project_root), name)
+
+# One resolved node in the dependency graph.
+pub class ResolvedDep:
+    pub name: str
+    pub version: str
+    pub constraint: str
+    pub source: str
+    pub checksum: str
+    pub requested_by: str
+    pub depth: int
+    pub edges: Vec[str]        # names of this package's own direct deps (for `taupkg tree`)
+
+extend ResolvedDep:
+    pub def init(name: str, version: str, constraint: str, source: str, checksum: str, requested_by: str, depth: int) -> ResolvedDep:
+        mut d = ResolvedDep()
+        d.name         = name
+        d.version      = version
+        d.constraint   = constraint
+        d.source       = source
+        d.checksum     = checksum
+        d.requested_by = requested_by
+        d.depth        = depth
+        d.edges        = Vec[str].init(4)
+        return d
+
+    pub def to_locked(self) -> LockedPkg:
+        mut lp = LockedPkg.init(self.name, self.version, self.source, self.checksum)
+        lp.constraint = self.constraint
+        return lp
+
+
+pub class Resolution:
+    pub ok: bool
+    pub error: str
+    pub order: Vec[str]                # package names in resolution order
+    pub by_name: Map[str, ResolvedDep]
+    pub root_deps: Vec[str]            # names of the root's own direct deps (tree roots)
+
+extend Resolution:
+    pub def init() -> Resolution:
+        mut r = Resolution()
+        r.ok       = true
+        r.error    = ""
+        r.order    = Vec[str].init(16)
+        r.by_name  = Map[str, ResolvedDep].init(16)
+        r.root_deps = Vec[str].init(8)
+        return r
+
+    # Flatten the resolution into a Lockfile (all direct + transitive packages).
+    pub def to_lockfile(self) -> Lockfile:
+        mut lf = Lockfile.init()
+        mut i = 0
+        while i < self.order.len:
+            mut nm = self.order.get(i)
+            i = i + 1
+            if self.by_name.contains(nm):
+                lf.packages.push(self.by_name.get(nm).to_locked())
+        return lf
+
+
+# Resolve the full graph from a root manifest.
+#   include_dev : also seed [dev-deps] (for `build`/`test` of the top-level project)
+#   locked      : replay taupkg.lock exactly — install nothing new, verify checksums
+#   offline     : never touch the network (reuse .taupkg/packages/ only)
+pub def resolve(root: Manifest, project_root: str, lock: Lockfile, include_dev: bool, locked: bool, offline: bool, verbose: bool) -> Resolution:
+    mut res = Resolution.init()
+
+    # BFS worklist as parallel Vecs (name, constraint, source, requester, depth,
+    # base); `head` is the queue front. `base` is the directory the entry's own
+    # `path` source resolves against — project_root for direct deps, and the
+    # requesting package's origin dir for transitive deps.
+    mut w_name = Vec[str].init(32)
+    mut w_con  = Vec[str].init(32)
+    mut w_src  = Vec[str].init(32)
+    mut w_req  = Vec[str].init(32)
+    mut w_dep  = Vec[int].init(32)
+    mut w_base = Vec[str].init(32)
+
+    # Seed with the root's direct dependencies (anchored at project_root).
+    # The raw value is the SOURCE (a version string, or an inline table like
+    # `{ path = ... }`); `dep_constraint` extracts the semver constraint used for
+    # version unification (path/git deps have none → "*").
+    for name in root.deps.keys():
+        mut raw = root.deps.get(name)
+        mut src = raw
+        if root.sources.contains(name): src = root.sources.get(name)
+        mut con = dep_constraint(src)
+        w_name.push(name); w_con.push(con); w_src.push(src); w_req.push("(root)"); w_dep.push(1); w_base.push(project_root)
+        res.root_deps.push(name)
+    if include_dev:
+        for name in root.dev_deps.keys():
+            mut raw = root.dev_deps.get(name)
+            mut src = raw
+            if root.sources.contains(name): src = root.sources.get(name)
+            mut con = dep_constraint(src)
+            w_name.push(name); w_con.push(con); w_src.push(src); w_req.push("(dev)"); w_dep.push(1); w_base.push(project_root)
+            res.root_deps.push(name)
+
+    mut head  = 0
+    mut guard = 0
+    while head < w_name.len and guard < 20000:
+        guard = guard + 1
+        mut name  = w_name.get(head)
+        mut con   = w_con.get(head)
+        mut raw_src = w_src.get(head)
+        mut req   = w_req.get(head)
+        mut depth = w_dep.get(head)
+        mut base  = w_base.get(head)
+        head = head + 1
+
+        # Anchor a local `path` source to the DECLARING manifest's directory.
+        mut src = rebase_source(name, raw_src, base)
+
+        # ── UNIFICATION ──────────────────────────────────────────────────────
+        # If we've already resolved this package, check the new constraint is satisfied by the
+        # chosen version. Because we always pick the highest compatible version, two compatible
+        # constraints unify automatically; an incompatible one is a genuine, reported conflict.
+        if res.by_name.contains(name):
+            mut ex = res.by_name.get(name)
+            mut ev = Version.init(ex.version)
+            if ev.satisfies(con):
+                continue
+            res.ok = false
+            res.error = "dependency conflict on '" + name + "':\n"
+            res.error = res.error + "    " + ex.requested_by + " requires " + ex.constraint + "  (resolved to " + ex.version + ")\n"
+            res.error = res.error + "    " + req + " requires " + con + "\n"
+            res.error = res.error + "  Tauraro links one version of each package; align these constraints or pin an explicit version."
+            return res
+
+        # ── FRESH RESOLVE + FETCH (needed to read the package's own taupkg.toml) ──
+        mut pkg = LockedPkg.init("", "", "", "")
+        if locked:
+            if not lock.has(name):
+                res.ok = false
+                res.error = "--locked: '" + name + "' is not in taupkg.lock — run `taupkg install` to refresh the lock."
+                return res
+            pkg = install_from_lock(lock.find(name), project_root, offline, verbose)
+        else:
+            pkg = install_package(name, con, src, project_root, verbose)
+
+        if pkg.name.len() == 0:
+            res.ok = false
+            res.error = "failed to resolve '" + name + "' (" + con + ") requested by " + req
+            return res
+
+        # Record a PORTABLE source in the lock: a rebased local dep is stored
+        # relative to project_root (so the lock survives a monorepo re-checkout at
+        # a different absolute location) rather than as an absolute machine path.
+        mut rec_source = pkg.source
+        if src.starts_with("local:"):
+            rec_source = "local:" + path_relative(project_root, src.slice(6, src.len()))
+        mut rd = ResolvedDep.init(name, pkg.version, con, rec_source, pkg.checksum, req, depth)
+
+        # The directory THIS package's own transitive path deps resolve against.
+        mut child_base = origin_dir_of(name, src, project_root)
+
+        # Enqueue this package's OWN dependencies (the transitive step Cargo does and taupkg didn't).
+        mut sub_toml = path_join(path_join(project_pkg_dir(project_root), name), "taupkg.toml")
+        if File.file_exists(sub_toml):
+            mut sub = Manifest.load(sub_toml)
+            for dn in sub.deps.keys():
+                mut draw = sub.deps.get(dn)
+                mut dsrc = draw
+                if sub.sources.contains(dn): dsrc = sub.sources.get(dn)
+                mut dcon = dep_constraint(dsrc)
+                rd.edges.push(dn)
+                w_name.push(dn); w_con.push(dcon); w_src.push(dsrc); w_req.push(name); w_dep.push(depth + 1); w_base.push(child_base)
+
+        res.by_name.insert(name, rd)
+        res.order.push(name)
+
+    return res

@@ -106,7 +106,7 @@ pub def parse_args(argv: Vec[str]) -> CliArgs:
 
 pub def print_usage():
     print("""
-taupkg -- Tauraro package manager v0.0.1
+taupkg -- Tauraro package manager v0.0.2
 
 Usage:
   taupkg <command> [options]
@@ -115,12 +115,18 @@ Commands:
   init [name]              Create taupkg.toml in the current directory
   add <pkg>[@constraint]   Add a dependency (and install it)
   remove <pkg>             Remove a dependency
-  install                  Install all deps listed in taupkg.toml
-  update [pkg]             Update all (or one) dep to newest compatible
-  build [--release] [-o f] Build the project
+  install [--locked]       Resolve + install the full dependency graph
+    [--offline]              Use only already-downloaded packages (no network)
+  update [pkg]             Re-resolve all (or one) dep to newest compatible
+  tree                     Print the resolved dependency graph
+  audit                    Verify installed packages against the lock (integrity)
+  build [--release]        Build the project
+    [--target <triple>]      Cross-compile (zero-config; tauraroc bundles zig cc)
+    [-o <file>]              Output binary path
   run [--release] [-- ...]  Build and run
-  test                     Build and run tests
+  test                     Build and run tests (includes [dev-deps])
   search <query>           Search the registry
+  login <token>            Store a registry token for publishing
   publish                  Publish this package to the registry
   info <pkg>               Show package information
   list                     List installed packages
@@ -133,5 +139,7 @@ Commands:
 Options:
   --verbose, -v            Show detailed output
   --release                Compile with -O3 optimizations
+  --locked / --offline     Reproducible install: replay the lock / no network
+  --target <triple>        Cross-compilation target
   -o <file>                Output binary path (build/run)
 """)

@@ -9,9 +9,10 @@ from lockfile import Lockfile, LockedPkg
 from semver import Version
 from source import parse_source
 from installer import install_package
+from resolver import resolve, Resolution, ResolvedDep
 from builder import build_project, run_binary, find_compiler
 from registry import registry_search
-from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf
+from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf, credentials_path, taupkg_home, hash_tree
 from tauraro_install import install_tauraro
 
 def main(argv: Vec[str]):
@@ -23,7 +24,7 @@ def main(argv: Vec[str]):
         return 0
 
     if args.command == "version":
-        print("taupkg 0.0.1")
+        print("taupkg 0.0.2")
         return 0
 
     if args.command == "install-tauraro":
@@ -53,8 +54,17 @@ def main(argv: Vec[str]):
     mut lock_path = path_join(project_root, "taupkg.lock")
     mut lockfile  = Lockfile.load(lock_path)
 
+    if args.command == "login":
+        return cmd_login(args)
+
     if args.command == "install":
-        return cmd_install(manifest, lockfile, lock_path, project_root, verbose)
+        return cmd_install(args, manifest, lockfile, lock_path, project_root, verbose)
+
+    if args.command == "tree":
+        return cmd_tree(manifest, lockfile, project_root, verbose)
+
+    if args.command == "audit":
+        return cmd_audit(manifest, lockfile, project_root, verbose)
 
     if args.command == "add":
         return cmd_add(args, manifest, manifest_path, lockfile, lock_path, project_root, verbose)
@@ -136,63 +146,37 @@ def cmd_init(args: CliArgs) -> int:
 
 # -- install --------------------------------------------------------------------
 
-def cmd_install(manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
-    mut changed = false
-    mut failed = false
+def cmd_install(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
+    mut locked  = args.flag("locked") or args.flag("frozen")
+    mut offline = args.flag("offline")
 
-    # Iterate deps via a Vec of (name, constraint) pairs we build from manifest.deps
-    # (Map has no iterator, so we resolve by looking at lockfile entries first then fresh deps)
-    # Note: we can't enumerate Map keys directly -- instead we iterate over lockfile entries
-    # and also process any dep names we received via the manifest sections object.
-    # For now, we read the raw toml dep section again to get the keys.
-    mut dep_names  = _collect_dep_names(manifest, project_root)
-
-    mut i = 0
-    while i < dep_names.len:
-        mut dep_name = dep_names.get(i)
-        mut constraint = "*"
-        if manifest.deps.contains(dep_name):
-            constraint = manifest.deps.get(dep_name)
-        mut source_uri = constraint
-        if manifest.sources.contains(dep_name):
-            source_uri = manifest.sources.get(dep_name)
-
-        # Check lockfile -- use locked version if it satisfies constraint
-        if lockfile.has(dep_name):
-            mut locked = lockfile.find(dep_name)
-            mut v = Version.init(locked.version)
-            if v.satisfies(constraint) and File.dir_exists(path_join(project_pkg_dir(project_root), dep_name)):
-                if verbose:
-                    print("  " + dep_name + "@" + locked.version + " (locked, up-to-date)")
-                i = i + 1
-                continue
-
-        if verbose:
-            print("Installing " + dep_name + " " + constraint + "...")
-        else:
-            print("Installing " + dep_name + "...")
-
-        mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
-        if pkg.name.len() == 0:
-            failed = true
-        else:
-            lockfile.upsert(pkg)
-            changed = true
-            print("  + " + dep_name + "@" + pkg.version)
-
-        i = i + 1
-
-    if changed:
-        lockfile.save(lock_path)
-
-    if failed:
-        print("Some packages failed to install.")
+    # In --locked mode we replay the existing lock exactly (CI-reproducible). Otherwise we resolve the
+    # FULL transitive graph fresh and (re)write the lock. Dev-deps are resolved for the top-level project
+    # so `test`/examples work; they are NOT propagated to consumers.
+    mut res = resolve(manifest, project_root, lockfile, true, locked, offline, verbose)
+    if not res.ok:
+        print("error: " + res.error)
         return 1
 
-    if dep_names.len == 0:
+    if res.order.len == 0:
         print("No dependencies to install.")
-    else:
-        print("All packages installed.")
+        return 0
+
+    # Report the resolved graph.
+    mut i = 0
+    while i < res.order.len:
+        mut nm = res.order.get(i)
+        i = i + 1
+        if res.by_name.contains(nm):
+            mut d = res.by_name.get(nm)
+            print("  + " + d.name + "@" + d.version)
+
+    # In --locked mode the lock is authoritative; otherwise persist the freshly-resolved graph.
+    if not locked:
+        mut new_lock = res.to_lockfile()
+        new_lock.save(lock_path)
+
+    print("Resolved " + str(res.order.len) + " package(s) (direct + transitive).")
     return 0
 
 
@@ -280,34 +264,22 @@ def cmd_remove(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: 
 # -- update ---------------------------------------------------------------------
 
 def cmd_update(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
-    mut target = args.first_pos()  # "" = update all
-
-    mut dep_names = _collect_dep_names(manifest, project_root)
-    mut changed = false
+    # `update` IGNORES the lock (locked=false) and re-resolves the whole graph to the newest compatible
+    # versions, then rewrites the lock. (A `<pkg>` argument updating only one package while keeping the
+    # rest pinned is a planned refinement — for now `update` refreshes the entire graph.)
+    mut res = resolve(manifest, project_root, lockfile, true, false, false, verbose)
+    if not res.ok:
+        print("error: " + res.error)
+        return 1
     mut i = 0
-    while i < dep_names.len:
-        mut dep_name = dep_names.get(i)
-        if target.len() > 0 and dep_name != target:
-            i = i + 1
-            continue
-
-        mut constraint = "*"
-        if manifest.deps.contains(dep_name):
-            constraint = manifest.deps.get(dep_name)
-        mut source_uri = constraint
-        if manifest.sources.contains(dep_name):
-            source_uri = manifest.sources.get(dep_name)
-
-        print("Updating " + dep_name + "...")
-        mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
-        if pkg.name.len() > 0:
-            lockfile.upsert(pkg)
-            changed = true
-            print("  -> " + dep_name + "@" + pkg.version)
+    while i < res.order.len:
+        mut nm = res.order.get(i)
         i = i + 1
-
-    if changed:
-        lockfile.save(lock_path)
+        if res.by_name.contains(nm):
+            mut d = res.by_name.get(nm)
+            print("  -> " + d.name + "@" + d.version)
+    res.to_lockfile().save(lock_path)
+    print("Updated to newest compatible versions.")
     return 0
 
 
@@ -316,7 +288,20 @@ def cmd_update(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path:
 def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
     mut release = args.flag("release")
     mut output  = args.flag_val("o", "")
-    mut ok = build_project(project_root, manifest, lockfile, output, release, verbose)
+    mut target  = args.flag_val("target", "")   # zero-config cross-compile (tauraroc bundles zig cc)
+
+    # Make sure the full transitive graph is present before compiling. If a lock exists, replay it
+    # (installing anything missing, verifying checksums); otherwise resolve fresh.
+    mut has_lock = lockfile.packages.len > 0
+    mut res = resolve(manifest, project_root, lockfile, false, has_lock, false, verbose)
+    if not res.ok:
+        print("error: " + res.error)
+        return 1
+    mut eff_lock = res.to_lockfile()
+    if not has_lock and eff_lock.packages.len > 0:
+        eff_lock.save(path_join(project_root, "taupkg.lock"))
+
+    mut ok = build_project(project_root, manifest, eff_lock, output, release, target, verbose)
     if ok:
         print("Build succeeded.")
         return 0
@@ -400,12 +385,8 @@ def cmd_publish(manifest: Manifest, manifest_path: str, project_root: str, verbo
     mut tarball = path_join(project_root, ".taupkg/" + manifest.name + "-" + manifest.version + ".tar.gz")
     mkdir_p(path_join(project_root, ".taupkg"))
     mut src_dir = path_join(project_root, "src")
-    mut cmd = ""
-    if OS.is_windows():
-        print("error: publish tarball creation not supported on Windows yet. Use WSL or git archive.")
-        return 1
-    else:
-        cmd = "tar -czf \"" + tarball + "\" -C \"" + project_root + "\" src/"
+    # `tar` ships with Windows 10+ (bsdtar) and every Unix, so one command works everywhere.
+    mut cmd = "tar -czf \"" + tarball + "\" -C \"" + project_root + "\" src taupkg.toml"
     mut rc = Process.system(cmd)
     if rc != 0:
         print("error: failed to create tarball")
@@ -442,34 +423,84 @@ pub def find_project_root(start_dir: str) -> str:
 
 # Re-parse the manifest TOML to get dep names as a Vec[str].
 # This exists because Map has no key-iteration; we parse the raw file.
-def _collect_dep_names(manifest: Manifest, project_root: str) -> Vec[str]:
-    from toml import toml_load
-    mut result = Vec[str].init(8)
-    mut toml_path = path_join(project_root, "taupkg.toml")
-    if not File.file_exists(toml_path):
-        return result
-    mut doc = toml_load(toml_path)
-    mut deps_sec = doc.get_section("deps")
-    # deps_sec.keys is a Map -- we cannot iterate it directly.
-    # Instead, compare against lockfile names + manifest dep names we know about.
-    # Best approach: re-read raw lines of the [deps] section.
-    mut content = File.read_text(toml_path)
-    mut lines = content.split("\n")
-    mut in_deps = false
+# -- tree -----------------------------------------------------------------------
+
+# Print the resolved dependency graph as an indented tree.
+def cmd_tree(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
+    mut has_lock = lockfile.packages.len > 0
+    mut res = resolve(manifest, project_root, lockfile, true, has_lock, false, verbose)
+    if not res.ok:
+        print("error: " + res.error)
+        return 1
+    print(manifest.name + " " + manifest.version)
     mut i = 0
-    while i < lines.len:
-        mut line = lines.get(i).trim()
-        if line == "[deps]" or line == "[dependencies]":
-            in_deps = true
-            i = i + 1
-            continue
-        if in_deps and line.starts_with("["):
-            in_deps = false
-        if in_deps and line.len() > 0 and not line.starts_with("#"):
-            mut eq = line.index_of("=")
-            if eq > 0:
-                mut name = line.slice(0, eq).trim()
-                if name.len() > 0:
-                    result.push(name)
+    while i < res.root_deps.len:
+        _print_tree_node(res, res.root_deps.get(i), "", i == res.root_deps.len - 1, 0)
         i = i + 1
-    return result
+    return 0
+
+def _print_tree_node(res: Resolution, name: str, prefix: str, last: bool, depth: int):
+    mut branch   = "|-- "
+    mut childpfx = "|   "
+    if last:
+        branch   = "`-- "
+        childpfx = "    "
+    if not res.by_name.contains(name):
+        print(prefix + branch + name + " (unresolved)")
+        return
+    mut d = res.by_name.get(name)
+    print(prefix + branch + d.name + " " + d.version)
+    if depth >= 40:
+        return   # cycle guard
+    mut i = 0
+    while i < d.edges.len:
+        _print_tree_node(res, d.edges.get(i), prefix + childpfx, i == d.edges.len - 1, depth + 1)
+        i = i + 1
+
+
+# -- audit ----------------------------------------------------------------------
+
+# Verify every installed package's content against its locked checksum (tamper/drift check).
+# A remote advisory-database check is a registry-v1 follow-up.
+def cmd_audit(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
+    if lockfile.packages.len == 0:
+        print("No taupkg.lock found -- run `taupkg install` first.")
+        return 0
+    print("Auditing " + str(lockfile.packages.len) + " locked package(s)...")
+    mut bad = 0
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        i = i + 1
+        if p.checksum.len() == 0 or p.checksum == "none":
+            continue
+        mut dir = path_join(project_pkg_dir(project_root), p.name)
+        if not File.dir_exists(dir):
+            print("  ! " + p.name + "@" + p.version + " -- not installed")
+            bad = bad + 1
+            continue
+        if hash_tree(dir) != p.checksum:
+            print("  ! " + p.name + "@" + p.version + " -- checksum MISMATCH (tampered or modified)")
+            bad = bad + 1
+    if bad == 0:
+        print("OK: integrity verified -- all installed packages match the lock.")
+        return 0
+    print("FAIL: " + str(bad) + " package(s) failed integrity verification.")
+    return 1
+
+
+# -- login ----------------------------------------------------------------------
+
+# Store a registry API token in ~/.taupkg/credentials for `taupkg publish`.
+def cmd_login(args: CliArgs) -> int:
+    mut token = args.first_pos()
+    if token.len() == 0:
+        token = args.flag_val("token", "")
+    if token.len() == 0:
+        print("Usage: taupkg login <token>")
+        print("Create a token in your registry account settings, then run `taupkg login <token>`.")
+        return 1
+    mkdir_p(taupkg_home())
+    File.write_text(credentials_path(), "token = \"" + token + "\"\n")
+    print("Saved credentials to " + credentials_path())
+    return 0

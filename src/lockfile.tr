@@ -13,16 +13,18 @@ from toml import toml_load, TomlDoc
 pub class LockedPkg:
     pub name: str
     pub version: str
-    pub source: str
-    pub checksum: str
+    pub source: str        # exact source, commit-pinned for git ("github:u/r@<sha>")
+    pub checksum: str      # full-tree content hash ("sha256:…")
+    pub constraint: str    # the resolved constraint this entry satisfies
 
 extend LockedPkg:
     pub def init(name: str, version: str, source: str, checksum: str) -> LockedPkg:
         mut p = LockedPkg()
-        p.name     = name
-        p.version  = version
-        p.source   = source
-        p.checksum = checksum
+        p.name       = name
+        p.version    = version
+        p.source     = source
+        p.checksum   = checksum
+        p.constraint = "*"
         return p
 
 
@@ -59,15 +61,17 @@ extend Lockfile:
         self.packages.push(pkg)
 
     pub def to_string(self) -> str:
-        mut out = "# taupkg lock file -- do not edit manually\n\n"
+        mut out = "# taupkg lock file -- do not edit manually\n"
+        out = out + "# It records the exact resolved dependency graph. Commit it for reproducible builds.\n\n"
         mut i = 0
         while i < self.packages.len:
             mut p = self.packages.get(i)
             out = out + "[[pkg]]\n"
-            out = out + "name     = \"" + p.name     + "\"\n"
-            out = out + "version  = \"" + p.version  + "\"\n"
-            out = out + "source   = \"" + p.source   + "\"\n"
-            out = out + "checksum = \"" + p.checksum + "\"\n"
+            out = out + "name       = \"" + p.name       + "\"\n"
+            out = out + "version    = \"" + p.version    + "\"\n"
+            out = out + "constraint = \"" + p.constraint + "\"\n"
+            out = out + "source     = \"" + p.source     + "\"\n"
+            out = out + "checksum   = \"" + p.checksum   + "\"\n"
             out = out + "\n"
             i = i + 1
         return out
@@ -88,11 +92,15 @@ extend Lockfile:
             mut version  = ""
             mut source   = ""
             mut checksum = ""
-            if sec.keys.contains("name"):     name     = sec.keys.get("name")
-            if sec.keys.contains("version"):  version  = sec.keys.get("version")
-            if sec.keys.contains("source"):   source   = sec.keys.get("source")
-            if sec.keys.contains("checksum"): checksum = sec.keys.get("checksum")
+            mut constraint = "*"
+            if sec.keys.contains("name"):       name       = sec.keys.get("name")
+            if sec.keys.contains("version"):    version    = sec.keys.get("version")
+            if sec.keys.contains("source"):     source     = sec.keys.get("source")
+            if sec.keys.contains("checksum"):   checksum   = sec.keys.get("checksum")
+            if sec.keys.contains("constraint"): constraint = sec.keys.get("constraint")
             if name.len() > 0:
-                lf.packages.push(LockedPkg.init(name, version, source, checksum))
+                mut lp = LockedPkg.init(name, version, source, checksum)
+                lp.constraint = constraint
+                lf.packages.push(lp)
             i = i + 1
         return lf

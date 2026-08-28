@@ -37,10 +37,64 @@ extend Source:
         return self.kind + ":" + self.uri
 
 
+# Parse a TOML inline table  `{ key = "val", key2 = "val2" }`  into a Map[str,str].
+# Values keep their unquoted string form; keys are trimmed. Robust to whitespace
+# and a trailing comma. (The dep-spec subset never contains commas inside values.)
+def _parse_inline_table(raw: str) -> Map[str, str]:
+    mut out = Map[str, str].init(8)
+    mut inner = raw.trim()
+    if inner.starts_with("{"): inner = inner.slice(1, inner.len())
+    if inner.ends_with("}"):   inner = inner.slice(0, inner.len() - 1)
+    for part in inner.split(","):
+        mut kv = part.trim()
+        if kv.len() == 0: continue
+        mut eq = kv.index_of("=")
+        if eq < 0: continue
+        mut k = kv.slice(0, eq).trim()
+        mut v = kv.slice(eq + 1, kv.len()).trim()
+        if v.starts_with("\"") and v.ends_with("\"") and v.len() >= 2:
+            v = v.slice(1, v.len() - 1)
+        out.insert(k, v)
+    return out
+
+# Pull the git/github ref (tag > branch > rev) out of an inline dep table.
+def _table_ref(tbl: Map[str, str]) -> str:
+    if tbl.contains("tag"):    return tbl.get("tag")
+    if tbl.contains("branch"): return tbl.get("branch")
+    if tbl.contains("rev"):    return tbl.get("rev")
+    return ""
+
+# The version CONSTRAINT implied by a raw dep value. Inline tables with a
+# `version` key carry a real constraint; path/git/github deps have none, so they
+# unify against anything ("*"). A bare string value IS the constraint.
+pub def dep_constraint(raw: str) -> str:
+    mut s = raw.trim()
+    if s.starts_with("{"):
+        mut tbl = _parse_inline_table(s)
+        if tbl.contains("version"): return tbl.get("version")
+        return "*"
+    return s
+
+
 # Parse a raw source string from taupkg.toml [sources] or [deps].
 # Plain version constraints like "^1.2.0" are returned as registry sources.
+# Inline tables `{ path = ... }` / `{ git = ... }` / `{ github = ... }` /
+# `{ version = ... }` select the corresponding source kind (Cargo-style).
 pub def parse_source(pkg_name: str, raw: str) -> Source:
     mut s = raw.trim()
+
+    # Cargo-style inline-table dependency specification.
+    if s.starts_with("{"):
+        mut tbl = _parse_inline_table(s)
+        if tbl.contains("path"):
+            return Source.init("local", tbl.get("path"), "")
+        if tbl.contains("git"):
+            return Source.init("git", tbl.get("git"), _table_ref(tbl))
+        if tbl.contains("github"):
+            return Source.init("github", "https://github.com/" + tbl.get("github") + ".git", _table_ref(tbl))
+        mut ver = "*"
+        if tbl.contains("version"): ver = tbl.get("version")
+        return Source.init("registry", pkg_name, ver)
 
     if s.starts_with("archive:"):
         return Source.init("archive", s.slice(8, s.len()), "")

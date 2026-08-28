@@ -10,7 +10,7 @@
 
 from std.io import File
 from std.os import OS, Process
-from util import path_join, mkdir_p, rm_rf, rm_f, cp_r, flatten_single_subdir, shell_capture, project_pkg_dir
+from util import path_join, mkdir_p, rm_rf, rm_f, cp_r, flatten_single_subdir, shell_capture, project_pkg_dir, hash_tree
 from source import Source, parse_source, source_clone_cmd
 from manifest import Manifest
 from lockfile import LockedPkg
@@ -60,6 +60,11 @@ pub def install_package(
         installed_version = mf.version
         if installed_version.len() == 0:
             installed_version = src.ref
+        # Pin the exact commit SHA in the recorded source, so the lock replays byte-for-byte even
+        # if the upstream tag/branch later moves (reproducibility + tamper-evidence).
+        mut sha = shell_capture("git -C \"" + pkg_dir + "\" rev-parse HEAD")
+        if sha.len() >= 7:
+            installed_source = src.kind + ":" + src.uri + "@" + sha
 
     elif src.kind == "archive":
         mkdir_p(pkg_dir)
@@ -112,14 +117,39 @@ pub def install_package(
         print("error: unknown source kind '" + src.kind + "' for " + pkg_name)
         return LockedPkg.init("", "", "", "")
 
-    # Checksum: sha256 of the installed taupkg.toml (or "none" if absent)
-    mut manifest_path = path_join(pkg_dir, "taupkg.toml")
-    mut checksum = "none"
-    if File.file_exists(manifest_path):
-        mut content = File.read_text(manifest_path)
-        checksum = "sha256:" + Hash.sha256(content)
+    # Integrity: a full-content hash of the ENTIRE installed tree (every source file), not just the
+    # manifest — so any tampering or drift is detectable on the next build/verify.
+    mut checksum = hash_tree(pkg_dir)
 
-    return LockedPkg.init(pkg_name, installed_version, installed_source, checksum)
+    mut result = LockedPkg.init(pkg_name, installed_version, installed_source, checksum)
+    result.constraint = constraint
+    return result
+
+
+# Replay an EXACT locked package (used by `taupkg install --locked`). Installs from the pinned source,
+# then re-hashes the tree and refuses to proceed if it doesn't match the lock (tamper/drift guard).
+# Returns an empty LockedPkg on any failure.
+pub def install_from_lock(lp: LockedPkg, project_root: str, offline: bool, verbose: bool) -> LockedPkg:
+    mut pkg_dir = path_join(project_pkg_dir(project_root), lp.name)
+    # If already present and matches, reuse it (offline-friendly, no network).
+    if File.dir_exists(pkg_dir):
+        if hash_tree(pkg_dir) == lp.checksum:
+            if verbose:
+                print("  " + lp.name + "@" + lp.version + " (locked, verified)")
+            return lp
+        rm_rf(pkg_dir)
+    if offline:
+        print("error: --offline: " + lp.name + " is not present in .taupkg/packages/ and cannot be fetched")
+        return LockedPkg.init("", "", "", "")
+    mut fetched = install_package(lp.name, lp.constraint, lp.source, project_root, verbose)
+    if fetched.name.len() == 0:
+        return LockedPkg.init("", "", "", "")
+    if lp.checksum != "none" and fetched.checksum != lp.checksum:
+        print("error: checksum mismatch for " + lp.name + " — locked " + lp.checksum + " but got " + fetched.checksum)
+        print("       the upstream source changed. Run `taupkg update " + lp.name + "` to accept the new content.")
+        rm_rf(pkg_dir)
+        return LockedPkg.init("", "", "", "")
+    return lp
 
 
 # Result returned by registry_resolve.

@@ -69,7 +69,7 @@ pub def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfil
 
 # Run the Tauraro compiler on the build sandbox.
 # Returns the compiler exit code (0 = success).
-pub def run_compiler(project_root: str, manifest: Manifest, output: str, release: bool, verbose: bool) -> int:
+pub def run_compiler(project_root: str, manifest: Manifest, output: str, release: bool, target: str, verbose: bool) -> int:
     mut build_dir = project_build_dir(project_root)
     mut cc = find_compiler()
 
@@ -82,12 +82,15 @@ pub def run_compiler(project_root: str, manifest: Manifest, output: str, release
     mut out_path = output
     if out_path.len() == 0:
         out_path = path_join(project_root, manifest.name)
-        if OS.is_windows():
+        if OS.is_windows() and target.len() == 0:
             out_path = out_path + ".exe"
 
     mut cmd = cc + " \"" + entry_path + "\" -o \"" + out_path + "\""
     if release:
         cmd = cmd + " -O3"
+    if target.len() > 0:
+        # tauraroc bundles zig cc, so cross-compiling needs no extra toolchain install.
+        cmd = cmd + " --target " + target
     if verbose:
         print("  " + cmd)
 
@@ -95,7 +98,7 @@ pub def run_compiler(project_root: str, manifest: Manifest, output: str, release
 
 
 # High-level build: prepare sandbox + compile.
-pub def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, verbose: bool) -> bool:
+pub def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, target: str, verbose: bool) -> bool:
     if verbose:
         print("Preparing build sandbox...")
     mut ok = prepare_sandbox(project_root, manifest, lockfile, verbose)
@@ -103,7 +106,7 @@ pub def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile,
         return false
     if verbose:
         print("Compiling " + manifest.name + "...")
-    mut rc = run_compiler(project_root, manifest, output, release, verbose)
+    mut rc = run_compiler(project_root, manifest, output, release, target, verbose)
     if rc != 0:
         print("error: compilation failed (exit code " + str(rc) + ")")
         return false

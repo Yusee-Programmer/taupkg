@@ -82,6 +82,10 @@ pub def toml_parse(content: str) -> TomlDoc:
     mut cur_section = TomlSection.init("_root")
     mut cur_arr_name = ""
     mut cur_arr_sec = TomlSection.init("")
+    # Accumulate the current array-of-tables in a LOCAL Vec and `insert` the completed Vec into the
+    # map exactly once. (We deliberately never `map.get(name)` and then push into the returned Vec —
+    # that get-then-mutate pattern on a Map value is what triggered the crash.)
+    mut cur_arr_vec = Vec[TomlSection].init(4)
     mut in_array = false
 
     mut lines = content.split("\n")
@@ -96,32 +100,26 @@ pub def toml_parse(content: str) -> TomlDoc:
 
         # [[array_section]]
         if line.starts_with("[[") and line.ends_with("]]"):
+            mut new_name = line.slice(2, line.len() - 2).trim()
             if in_array:
-                if doc.array_sections.contains(cur_arr_name):
-                    mut arr = doc.array_sections.get(cur_arr_name)
-                    arr.push(cur_arr_sec)
-                else:
-                    mut arr = Vec[TomlSection].init(4)
-                    arr.push(cur_arr_sec)
-                    doc.array_sections.insert(cur_arr_name, arr)
+                cur_arr_vec.push(cur_arr_sec)             # finish the previous [[...]] table
+                if new_name != cur_arr_name:
+                    doc.array_sections.insert(cur_arr_name, cur_arr_vec)
+                    cur_arr_vec = Vec[TomlSection].init(4)
             else:
                 doc.sections.push(cur_section)
                 cur_section = TomlSection.init("_root")
             in_array = true
-            cur_arr_name = line.slice(2, line.len() - 2).trim()
-            cur_arr_sec = TomlSection.init(cur_arr_name)
+            cur_arr_name = new_name
+            cur_arr_sec = TomlSection.init(new_name)
             continue
 
         # [section]
         if line.starts_with("[") and line.ends_with("]") and not line.starts_with("[["):
             if in_array:
-                if doc.array_sections.contains(cur_arr_name):
-                    mut arr = doc.array_sections.get(cur_arr_name)
-                    arr.push(cur_arr_sec)
-                else:
-                    mut arr2 = Vec[TomlSection].init(4)
-                    arr2.push(cur_arr_sec)
-                    doc.array_sections.insert(cur_arr_name, arr2)
+                cur_arr_vec.push(cur_arr_sec)
+                doc.array_sections.insert(cur_arr_name, cur_arr_vec)
+                cur_arr_vec = Vec[TomlSection].init(4)
                 in_array = false
             else:
                 doc.sections.push(cur_section)
@@ -140,15 +138,10 @@ pub def toml_parse(content: str) -> TomlDoc:
             else:
                 cur_section.keys.insert(key, val)
 
-    # Flush the last section
+    # Flush the last section / array.
     if in_array:
-        if doc.array_sections.contains(cur_arr_name):
-            mut arr = doc.array_sections.get(cur_arr_name)
-            arr.push(cur_arr_sec)
-        else:
-            mut arr3 = Vec[TomlSection].init(4)
-            arr3.push(cur_arr_sec)
-            doc.array_sections.insert(cur_arr_name, arr3)
+        cur_arr_vec.push(cur_arr_sec)
+        doc.array_sections.insert(cur_arr_name, cur_arr_vec)
     else:
         doc.sections.push(cur_section)
 
