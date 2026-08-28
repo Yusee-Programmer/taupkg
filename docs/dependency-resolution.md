@@ -29,9 +29,36 @@ error: dependency conflict on 'liblog':
   explicit version.
 ```
 
-The resolver walks the graph breadth-first, reading each package's own
-`taupkg.toml` to discover its dependencies (the transitive step), and always
-prefers the highest version satisfying a constraint.
+### How selection works
+
+The resolver walks the graph, reading each package's own `taupkg.toml` to discover
+its dependencies (the transitive step), and:
+
+1. **accumulates every constraint** on a package from all of its dependents,
+2. **selects the highest version satisfying the intersection** of those
+   constraints (for a registry dep, from its full version list; for a
+   path/git/archive dep, the single available version is validated against them),
+3. **re-selects and re-walks to a fixpoint** when a later constraint tightens the
+   choice — this is the backtracking that lets a compatible single version be
+   found even when a naive first pick would have failed.
+
+When no single version can satisfy every constraint, resolution stops with a
+world-class report — every constraint, who imposed it, the available/resolved
+versions, and concrete remediation:
+
+```
+error: cannot select a single version of 'shared'
+
+  'shared' is required by:
+    - (root)     requires  ^2.0
+    - libx 1.0.0 requires  ^1.2
+  ...
+  To fix:
+    - relax a constraint so a shared version exists, or
+    - pin it explicitly in [deps]:  shared = "<version>", or
+    - if two incompatible majors are genuinely needed, they cannot coexist in one
+      build — split the dependency or vendor one under a new name.
+```
 
 ---
 

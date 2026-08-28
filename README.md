@@ -13,23 +13,32 @@ generation** from C/C++ headers.
 
 ## What's new in 0.0.2
 
-- **Transitive dependency resolution** — the full dependency graph is resolved
-  and unified to a single version per package (Tauraro links one copy of each
-  module). Conflicts are hard, clearly-reported errors, never silent duplicates.
+- **Smart dependency resolution** — the full transitive graph is resolved with
+  **constraint accumulation across the whole graph** and **backtracking version
+  selection**, unified to a single version per package. When no version can
+  satisfy everyone, you get a **world-class conflict report** (every constraint,
+  who imposed it, available versions, concrete fixes) — never a silent duplicate.
 - **Automatic `TAURARO_PATH`** — `taupkg build`/`run`/`test` set the compiler's
   module search path automatically and compile your project **in place** (no
   sandbox copy). `from <dep> import X` just works. `taupkg env` prints the path
   for compiling with `tauraroc` directly.
 - **Inline-table dependencies** — Cargo-style `{ path = … }`, `{ git = … }`,
-  `{ github = … }`, `{ version = … }` alongside the classic string form.
-- **Per-manifest path rebasing** — a `path` dependency resolves relative to the
-  manifest that *declares* it (correct for nested/monorepo layouts).
-- **Integrity** — every dependency is content-hashed (Merkle-style) into the
-  lock; `taupkg audit` re-verifies installed packages against it.
-- **New commands**: `tree`, `audit`, `login`, `env`, and **`bindgen`**.
-- **New flags**: `--locked`, `--offline`, `--sandbox`, `--target <triple>`.
+  `{ github = … }`, `{ version = … }`, `{ …, optional = true }`, alongside the
+  classic string form. Per-manifest **path rebasing** (correct for monorepos).
+- **Features** — `[features]` with `--features`, `--all-features`, and
+  `--no-default-features` gate optional dependencies.
+- **Workspaces** — a `[workspace]` root fans `install`/`build`/`test`/`tree` out
+  across member packages (with inter-member path deps).
+- **Security** — content-hashed lock + `taupkg audit` (integrity **and**
+  advisory/vulnerability check) + `taupkg sbom` (CycloneDX SBOM).
+- **Real test runner** — `taupkg test` compiles and runs every `tests/*.tr`.
+- **FFI bindgen** — `taupkg bindgen` turns a C/C++ header into an importable package.
+- **New commands**: `tree`, `audit`, `sbom`, `login`, `env`, and **`bindgen`**.
+- **New flags**: `--locked`, `--offline`, `--sandbox`, `--target`, `--features`,
+  `--all-features`, `--no-default-features`, `publish --dry-run`.
 
-See [Dependency resolution](#dependency-resolution) and
+See [Dependency resolution](#dependency-resolution),
+[Features](#features), [Workspaces](#workspaces), [Security](#security), and
 [Generating FFI bindings](#generating-ffi-bindings-bindgen) for the details.
 
 ### In-depth guides
@@ -47,10 +56,13 @@ See [Dependency resolution](#dependency-resolution) and
 - [taupkg.toml reference](#taupkgtoml-reference)
 - [taupkg.lock](#taupkglock)
 - [Dependency resolution](#dependency-resolution)
+- [Features](#features)
+- [Workspaces](#workspaces)
+- [Security](#security)
 - [Commands](#commands)
   - [init](#init) · [add](#add) · [remove](#remove) · [install](#install)
   - [update](#update) · [build](#build) · [run](#run) · [test](#test)
-  - [tree](#tree) · [audit](#audit) · [env](#env) · [bindgen](#bindgen)
+  - [tree](#tree) · [audit](#audit) · [sbom](#sbom) · [env](#env) · [bindgen](#bindgen)
   - [list](#list) · [info](#info) · [search](#search) · [login](#login)
   - [publish](#publish) · [clean](#clean) · [install-tauraro](#install-tauraro)
 - [Dependency sources](#dependency-sources)
@@ -220,8 +232,30 @@ taupkg builds the **entire transitive dependency graph**, then unifies every
 package to a **single version**. This is deliberate: Tauraro's unity build links
 exactly one copy of each module, so — unlike Cargo, which can keep multiple
 semver-major versions side by side — taupkg resolves each package to one version.
-Two compatible constraints (`^1.0` and `^1.2`) unify automatically to the newest
-matching version; a genuine conflict is a hard, clearly-reported error.
+
+To make that constraint bite as rarely as possible, the resolver **accumulates
+every constraint** on a package across the whole graph, **selects the highest
+version satisfying the intersection**, and re-selects/re-walks to a fixpoint when
+a later constraint tightens (**backtracking version selection**). Two compatible
+constraints (`^1.0` and `^1.2`) unify automatically to the newest matching
+version. When no single version can satisfy everyone, you get a **world-class
+conflict report** listing every constraint, who imposed it, the available/resolved
+versions, and concrete fixes:
+
+```
+error: cannot select a single version of 'shared'
+
+  'shared' is required by:
+    - (root)     requires  ^2.0
+    - libx 1.0.0 requires  ^1.2
+
+  'shared' resolves to 1.5.0 from local:../shared, which does not satisfy all of
+  the above ... To fix:
+    - relax a constraint so a shared version exists, or
+    - pin it explicitly in [deps]:  shared = "<version>", or
+    - if two incompatible majors are genuinely needed, they cannot coexist in one
+      build — split the dependency or vendor one under a new name.
+```
 
 ### Automatic module path (`TAURARO_PATH`)
 
@@ -246,6 +280,102 @@ from mathlib import add      # mathlib is a [deps] entry
 A `path` dependency resolves **relative to the manifest that declares it**, not
 the project root. So a dependency at `libs/liba` that declares
 `libb = { path = "../libb" }` correctly finds `libs/libb`.
+
+---
+
+## Features
+
+Optional dependencies are pulled in only when a feature enables them. Declare a
+dependency `optional`, then wire it up under `[features]`:
+
+```toml
+[deps]
+serde   = { version = "^1.0", optional = true }
+openssl = { version = "^0.10", optional = true }
+
+[features]
+default = "json"           # enabled unless --no-default-features
+json    = "serde"          # a feature enables an optional dep …
+full    = "json, tls"      # … or other features
+tls     = "openssl"
+```
+
+Select features at build/install time:
+
+```sh
+taupkg build                              # default features
+taupkg build --features tls               # default + tls
+taupkg build --no-default-features        # nothing optional
+taupkg build --no-default-features --features full   # exactly `full`
+taupkg build --all-features               # everything
+```
+
+A non-optional dependency is always built; an optional one is built only when an
+enabled feature names it (transitively).
+
+---
+
+## Workspaces
+
+A `[workspace]` root groups several member packages. `install`, `build`, `test`,
+and `tree` fan out across every member:
+
+```toml
+# workspace-root/taupkg.toml  (a "virtual" manifest — no [package] needed)
+[workspace]
+members = ["crates/app", "crates/lib"]
+```
+
+```sh
+taupkg build      # builds crates/app and crates/lib
+```
+
+Each member is a normal taupkg package with its own `taupkg.toml` and `src/`.
+Members may depend on each other via `path` deps (`lib = { path = "../lib" }`),
+which resolve correctly thanks to per-manifest path rebasing.
+
+---
+
+## Security
+
+taupkg records a full-tree SHA-256 content hash of every dependency in the lock,
+and offers two commands on top:
+
+- **`taupkg audit`** verifies installed packages against those hashes (integrity)
+  **and** checks them against an advisory database (vulnerabilities):
+
+  ```
+  Auditing 2 locked package(s)...
+  OK: integrity verified -- all installed packages match the lock.
+
+  Checking 2 package(s) against 1 advisory(ies)...
+    ! [high] shared@1.5.0 — TAUP-2025-0001
+        integer overflow in sval() before 1.6.0
+        affected: <1.6.0
+  ```
+
+  Advisories are read from `.taupkg/advisories.toml` (project) or
+  `~/.taupkg/advisories.toml` (global):
+
+  ```toml
+  [[advisory]]
+  id          = "TAUP-2025-0001"
+  package     = "shared"
+  versions    = "<1.6.0"       # a version is affected if it satisfies this
+  severity    = "high"
+  description = "integer overflow in sval() before 1.6.0"
+  ```
+
+- **`taupkg sbom`** emits a CycloneDX 1.5 software bill of materials of the
+  resolved graph (name, version, `pkg:tauraro/...` purl, SHA-256 hash, source):
+
+  ```sh
+  taupkg sbom -o sbom.json
+  ```
+
+> **Note on signing.** Package integrity is checksum-based (tamper-evident against
+> the lock). Cryptographic *signing* (ed25519) is not yet available — it awaits
+> asymmetric-crypto support in the Tauraro standard library.
 
 ---
 
@@ -328,17 +458,19 @@ constraints, then update `taupkg.lock`.
 ### build
 
 ```sh
-taupkg build [--release] [--sandbox] [--target <triple>] [-o output]
+taupkg build [--release] [--sandbox] [--target <triple>] [--features a,b] [-o output]
 ```
 
 Resolve the graph, set `TAURARO_PATH`, and compile the entry point (`bin` field)
-into a binary.
+into a binary. In a `[workspace]` root, builds every member.
 
 | Flag | Description |
 |------|-------------|
 | `--release` | Compile with `-O3` optimisations |
 | `--sandbox` | Hermetic build: copy sources into `.taupkg/build/` and compile there |
 | `--target <triple>` | Cross-compile (zero-config — tauraroc bundles `zig cc`) |
+| `--features a,b` | Enable features (see [Features](#features)) |
+| `--all-features` / `--no-default-features` | Enable all / none of the default features |
 | `-o <file>` | Override the output binary path |
 
 Cross-compilation examples: `--target linux-arm64`, `--target windows-x64`,
@@ -366,8 +498,16 @@ taupkg run -- --port 8080
 taupkg test [--verbose]
 ```
 
-Compile and run test files in `tests/` (includes `[dev-deps]`). `TAURARO_PATH`
-is set automatically so tests can import the project's dependencies.
+Compile and run every `tests/*.tr` file (includes `[dev-deps]`). A file passes
+iff it compiles, runs, and its output contains no `FAILED`. `TAURARO_PATH` is set
+automatically so tests can import the project's dependencies.
+
+```
+Running 2 test file(s)...
+  ok              test_core.tr
+  FAIL            test_edge.tr
+Test files: 2, passed: 1, failed: 1
+```
 
 ---
 
@@ -393,13 +533,28 @@ app 0.1.0
 taupkg audit
 ```
 
-Re-hash every installed package and verify it against the checksum recorded in
-`taupkg.lock`. Reports tampering or drift.
+Re-hash every installed package and verify it against the checksum in
+`taupkg.lock` (integrity), then check every package against the advisory database
+(vulnerabilities). Exits non-zero if either fails. See [Security](#security).
 
 ```
 Auditing 2 locked package(s)...
 OK: integrity verified -- all installed packages match the lock.
+
+Checking 2 package(s) against 1 advisory(ies)...
+OK: no known vulnerabilities.
 ```
+
+---
+
+### sbom
+
+```sh
+taupkg sbom [-o <file>]
+```
+
+Emit a CycloneDX 1.5 SBOM of the resolved dependency graph (to stdout, or to a
+file with `-o`). See [Security](#security).
 
 ---
 

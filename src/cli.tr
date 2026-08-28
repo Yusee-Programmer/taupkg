@@ -119,10 +119,14 @@ Commands:
     [--offline]              Use only already-downloaded packages (no network)
   update [pkg]             Re-resolve all (or one) dep to newest compatible
   tree                     Print the resolved dependency graph
-  audit                    Verify installed packages against the lock (integrity)
+  audit                    Verify integrity against the lock + check advisories
+  sbom [-o <file>]         Emit a CycloneDX SBOM of the dependency graph
   build [--release]        Build the project (auto-sets TAURARO_PATH, compiles in place)
     [--target <triple>]      Cross-compile (zero-config; tauraroc bundles zig cc)
     [--sandbox]              Hermetic build: copy into .taupkg/build/ (fallback)
+    [--features a,b]         Enable feature(s) (pulls in their optional deps)
+    [--all-features]         Enable every feature
+    [--no-default-features]  Do not enable [features].default
     [-o <file>]              Output binary path
   run [--release] [-- ...]  Build and run
   env                      Print the TAURARO_PATH line to run `tauraroc` directly
@@ -135,7 +139,7 @@ Commands:
   test                     Build and run tests (includes [dev-deps])
   search <query>           Search the registry
   login <token>            Store a registry token for publishing
-  publish                  Publish this package to the registry
+  publish [--dry-run]      Publish to the registry (--dry-run validates only)
   info <pkg>               Show package information
   list                     List installed packages
   clean                    Remove .taupkg/build/

@@ -75,6 +75,15 @@ pub def dep_constraint(raw: str) -> str:
         return "*"
     return s
 
+# True if a dependency is declared optional (`{ ..., optional = true }`).
+# Optional deps are only pulled in when a [features] entry enables them.
+pub def dep_is_optional(raw: str) -> bool:
+    mut s = raw.trim()
+    if not s.starts_with("{"): return false
+    mut tbl = _parse_inline_table(s)
+    if tbl.contains("optional"): return tbl.get("optional") == "true"
+    return false
+
 
 # Parse a raw source string from taupkg.toml [sources] or [deps].
 # Plain version constraints like "^1.2.0" are returned as registry sources.

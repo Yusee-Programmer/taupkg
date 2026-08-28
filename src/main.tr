@@ -1,7 +1,7 @@
 # taupkg -- Tauraro package manager
 # Entry point: command dispatch.
 
-from std.io import File
+from std.io import File, Dir
 from std.os import OS, Process, Env
 from cli import parse_args, print_usage, CliArgs
 from manifest import Manifest
@@ -12,7 +12,9 @@ from installer import install_package
 from resolver import resolve, Resolution, ResolvedDep
 from builder import build_project, run_binary, find_compiler, tauraro_path_value, apply_tauraro_path
 from registry import registry_search
-from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf, credentials_path, taupkg_home, hash_tree
+from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf, credentials_path, taupkg_home, hash_tree, shell_quote, shell_run, path_resolve
+from security import generate_sbom, load_advisories, audit_advisories
+from features import apply_features, parse_feature_list
 from tauraro_install import install_tauraro
 from bindgen_cmd import cmd_bindgen
 
@@ -53,6 +55,14 @@ def main(argv: Vec[str]):
         return 1
 
     mut manifest = Manifest.load(manifest_path)
+
+    # Workspace: fan out multi-member commands before the single-package validity
+    # check (a virtual workspace manifest may have no [package]).
+    if manifest.is_workspace():
+        mut wc = args.command
+        if wc == "install" or wc == "build" or wc == "test" or wc == "tree":
+            return cmd_workspace(wc, args, manifest, project_root, verbose)
+
     if not manifest.is_valid():
         print("error: invalid taupkg.toml -- 'name' and 'version' are required")
         return 1
@@ -71,6 +81,9 @@ def main(argv: Vec[str]):
 
     if args.command == "audit":
         return cmd_audit(manifest, lockfile, project_root, verbose)
+
+    if args.command == "sbom":
+        return cmd_sbom(args, manifest, lockfile, project_root)
 
     if args.command == "add":
         return cmd_add(args, manifest, manifest_path, lockfile, lock_path, project_root, verbose)
@@ -108,7 +121,7 @@ def main(argv: Vec[str]):
         return 0
 
     if args.command == "publish":
-        return cmd_publish(manifest, manifest_path, project_root, verbose)
+        return cmd_publish(args, manifest, manifest_path, project_root, verbose)
 
     print("error: unknown command '" + args.command + "'. Run `taupkg help` for usage.")
 
@@ -158,6 +171,9 @@ def cmd_init(args: CliArgs) -> int:
 def cmd_install(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
     mut locked  = args.flag("locked") or args.flag("frozen")
     mut offline = args.flag("offline")
+
+    # Feature gating: drop optional deps not enabled by the selected features.
+    apply_features(manifest, parse_feature_list(args.flag_val("features", "")), not args.flag("no-default-features"), args.flag("all-features"))
 
     # In --locked mode we replay the existing lock exactly (CI-reproducible). Otherwise we resolve the
     # FULL transitive graph fresh and (re)write the lock. Dev-deps are resolved for the top-level project
@@ -300,6 +316,9 @@ def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_roo
     mut target  = args.flag_val("target", "")   # zero-config cross-compile (tauraroc bundles zig cc)
     mut sandbox = args.flag("sandbox")          # hermetic fallback: copy into .taupkg/build/
 
+    # Feature gating: drop optional deps not enabled by the selected features.
+    apply_features(manifest, parse_feature_list(args.flag_val("features", "")), not args.flag("no-default-features"), args.flag("all-features"))
+
     # Make sure the full transitive graph is present before compiling. If a lock exists, replay it
     # (installing anything missing, verifying checksums); otherwise resolve fresh.
     mut has_lock = lockfile.packages.len > 0
@@ -316,6 +335,42 @@ def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_roo
         print("Build succeeded.")
         return 0
     return 1
+
+
+# -- workspace ------------------------------------------------------------------
+# Fan a command out across every [workspace] member. Each member is a normal
+# taupkg package (its own taupkg.toml + src) resolved/built in its own directory;
+# path deps between members resolve via the usual per-manifest rebasing.
+def cmd_workspace(cmd: str, args: CliArgs, root: Manifest, project_root: str, verbose: bool) -> int:
+    mut n = root.workspace_members.len
+    print("Workspace: " + str(n) + " member(s)")
+    mut rc = 0
+    mut i = 0
+    while i < n:
+        mut member = root.workspace_members.get(i)
+        i = i + 1
+        mut mdir = path_resolve(project_root, member)
+        mut mtoml = path_join(mdir, "taupkg.toml")
+        if not File.file_exists(mtoml):
+            print("  ! member '" + member + "' has no taupkg.toml — skipping")
+            rc = 1
+            continue
+        mut mman = Manifest.load(mtoml)
+        mut mlock_path = path_join(mdir, "taupkg.lock")
+        mut mlock = Lockfile.load(mlock_path)
+        print("")
+        print("== " + mman.name + "  (" + member + ") ==")
+        mut r = 0
+        if cmd == "install":
+            r = cmd_install(args, mman, mlock, mlock_path, mdir, verbose)
+        elif cmd == "build":
+            r = cmd_build(args, mman, mlock, mdir, verbose)
+        elif cmd == "test":
+            r = cmd_test(mman, mlock, mdir, verbose)
+        elif cmd == "tree":
+            r = cmd_tree(mman, mlock, mdir, verbose)
+        if r != 0: rc = r
+    return rc
 
 
 # -- env ------------------------------------------------------------------------
@@ -347,20 +402,55 @@ def cmd_test(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose:
     # Tests import the project's deps too — set TAURARO_PATH automatically.
     apply_tauraro_path(project_root, lockfile, verbose)
 
-    # Find test files: tests/test_*.tr
-    mut rc = Process.system("ls \"" + test_dir + "\"")  # for now just check dir is non-empty
-    # TODO: When tau gets a built-in test runner, delegate here.
-    # For now, compile and run each test_*.tr file.
-    print("Running tests in " + test_dir + "...")
-    mut cmd = cc + " " + test_dir + "/test_*.tr -o .taupkg/test_runner"
-    if OS.is_windows():
-        cmd = cc + " \"" + test_dir + "\\test_all.tr\" -o \".taupkg\\test_runner.exe\""
-    mut result = Process.system(cmd)
-    if result != 0:
-        return result
-    if OS.is_windows():
-        return Process.system(".taupkg\\test_runner.exe")
-    return Process.system(".taupkg/test_runner")
+    # Collect every `.tr` test file. A file passes iff it compiles, runs with
+    # exit code 0, and its output does not contain "FAILED".
+    mut entries = Dir.init(test_dir).list()
+    mut files = Vec[str].init(8)
+    mut e = 0
+    while e < entries.len:
+        mut nm = entries.get(e)
+        e = e + 1
+        if nm.ends_with(".tr"): files.push(nm)
+    if files.len == 0:
+        print("No .tr test files found in " + test_dir + ".")
+        return 0
+
+    mkdir_p(path_join(project_root, ".taupkg"))
+    print("Running " + str(files.len) + " test file(s)...")
+    mut passed = 0
+    mut failed = 0
+    mut k = 0
+    while k < files.len:
+        mut f = files.get(k)
+        k = k + 1
+        mut src = path_join(test_dir, f)
+        mut base = f
+        if base.ends_with(".tr"): base = base.slice(0, base.len() - 3)
+        mut outbin = path_join(project_root, ".taupkg/_test_" + base)
+        mut nul = "/dev/null"
+        if OS.is_windows():
+            outbin = outbin + ".exe"
+            nul = "nul"
+        mut crc = shell_run(shell_quote(cc) + " " + shell_quote(src) + " -o " + shell_quote(outbin) + " >" + nul + " 2>&1")
+        if crc != 0:
+            print("  FAIL (compile)  " + f)
+            failed = failed + 1
+            continue
+        # A test passes iff it runs and its output doesn't contain "FAILED"
+        # (the std.test TestRunner convention).
+        mut output = shell_capture(shell_quote(outbin))
+        if output.contains("FAILED"):
+            print("  FAIL            " + f)
+            failed = failed + 1
+        else:
+            print("  ok              " + f)
+            passed = passed + 1
+
+    print("")
+    print("Test files: " + str(files.len) + ", passed: " + str(passed) + ", failed: " + str(failed))
+    if failed > 0:
+        return 1
+    return 0
 
 
 # -- list -----------------------------------------------------------------------
@@ -409,18 +499,40 @@ def cmd_search(args: CliArgs) -> int:
 
 # -- publish --------------------------------------------------------------------
 
-def cmd_publish(manifest: Manifest, manifest_path: str, project_root: str, verbose: bool) -> int:
+def cmd_publish(args: CliArgs, manifest: Manifest, manifest_path: str, project_root: str, verbose: bool) -> int:
     from registry import registry_publish
-    # Create a tarball of the project src/
+    mut dry = args.flag("dry-run")
+
+    # ── pre-flight validation (fail early with clear guidance) ────────────────
+    mut problems = 0
+    if manifest.name.len() == 0:
+        print("error: [package].name is required to publish."); problems = problems + 1
+    if manifest.version.len() == 0:
+        print("error: [package].version is required to publish."); problems = problems + 1
+    mut src_dir = path_join(project_root, "src")
+    if not File.dir_exists(src_dir):
+        print("error: no src/ directory to publish."); problems = problems + 1
+    if problems > 0:
+        return 1
+
+    # Create a reproducible tarball of src/ + the manifest.
     mut tarball = path_join(project_root, ".taupkg/" + manifest.name + "-" + manifest.version + ".tar.gz")
     mkdir_p(path_join(project_root, ".taupkg"))
-    mut src_dir = path_join(project_root, "src")
     # `tar` ships with Windows 10+ (bsdtar) and every Unix, so one command works everywhere.
     mut cmd = "tar -czf \"" + tarball + "\" -C \"" + project_root + "\" src taupkg.toml"
     mut rc = Process.system(cmd)
-    if rc != 0:
-        print("error: failed to create tarball")
+    if rc != 0 or not File.file_exists(tarball):
+        print("error: failed to create package tarball.")
         return 1
+
+    if dry:
+        print("Dry run: package '" + manifest.name + " " + manifest.version + "' is valid.")
+        print("  tarball: " + tarball)
+        print("  contents:")
+        Process.system("tar -tzf \"" + tarball + "\"")
+        print("Nothing was uploaded (--dry-run). Remove --dry-run to publish.")
+        return 0
+
     mut ok = registry_publish(manifest_path, tarball)
     if ok:
         print("Published " + manifest.name + " " + manifest.version)
@@ -514,9 +626,40 @@ def cmd_audit(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose
             bad = bad + 1
     if bad == 0:
         print("OK: integrity verified -- all installed packages match the lock.")
+    else:
+        print("FAIL: " + str(bad) + " package(s) failed integrity verification.")
+
+    # Vulnerability check against the advisory database (project-local or global).
+    mut advisories = load_advisories(project_root)
+    mut vulns = 0
+    if advisories.len > 0:
+        print("")
+        print("Checking " + str(lockfile.packages.len) + " package(s) against " + str(advisories.len) + " advisory(ies)...")
+        vulns = audit_advisories(lockfile, advisories)
+        if vulns == 0:
+            print("OK: no known vulnerabilities.")
+        else:
+            print("FOUND: " + str(vulns) + " known vulnerability(ies) — see above.")
+
+    if bad == 0 and vulns == 0:
         return 0
-    print("FAIL: " + str(bad) + " package(s) failed integrity verification.")
     return 1
+
+
+# -- sbom -----------------------------------------------------------------------
+# Emit a CycloneDX 1.5 SBOM of the resolved dependency graph.
+def cmd_sbom(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_root: str) -> int:
+    if lockfile.packages.len == 0:
+        print("No taupkg.lock found -- run `taupkg install` first.")
+        return 1
+    mut doc = generate_sbom(manifest, lockfile)
+    mut out = args.flag_val("o", "")
+    if out.len() > 0:
+        File.write_text(out, doc)
+        print("Wrote SBOM (" + str(lockfile.packages.len) + " components) to " + out)
+    else:
+        print(doc)
+    return 0
 
 
 # -- login ----------------------------------------------------------------------
