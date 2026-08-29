@@ -16,6 +16,7 @@ from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_bui
 from security import generate_sbom, load_advisories, audit_advisories
 from features import apply_features, parse_feature_list
 from signing import key_generate, key_pubkey, sign_message, verify_message, trust_key, is_trusted, key_path, verify_package, package_signer
+from progress import check, header, fmt_bytes
 from tauraro_install import install_tauraro
 from bindgen_cmd import cmd_bindgen
 
@@ -198,20 +199,19 @@ def cmd_install(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path
         return 0
 
     # Report the resolved graph.
+    header("Installed " + str(res.order.len) + " package(s)")
     mut i = 0
     while i < res.order.len:
         mut nm = res.order.get(i)
         i = i + 1
         if res.by_name.contains(nm):
             mut d = res.by_name.get(nm)
-            print("  + " + d.name + "@" + d.version)
+            check(d.name, d.version)
 
     # In --locked mode the lock is authoritative; otherwise persist the freshly-resolved graph.
     if not locked:
         mut new_lock = res.to_lockfile()
         new_lock.save(lock_path)
-
-    print("Resolved " + str(res.order.len) + " package(s) (direct + transitive).")
     return 0
 
 
@@ -535,15 +535,19 @@ def cmd_publish(args: CliArgs, manifest: Manifest, manifest_path: str, project_r
         print("error: failed to create package tarball.")
         return 1
 
-    # Sign the package's content checksum with the default key, if one exists.
-    mut checksum = hash_tree(src_dir)
+    # Sign the package's whole-tree content checksum with the default key, if one
+    # exists, and drop a `taupkg.sig` at the package root. That file travels with
+    # the package (path/git/registry) and is what a consumer's `taupkg audit`
+    # verifies against the trusted-keys set. `taupkg.sig` is excluded from the
+    # hash, so its presence doesn't change the checksum it certifies.
+    mut checksum = hash_tree(project_root)
     mut signer_pk = key_pubkey("default")
     mut signature = ""
     if signer_pk.len() > 0:
         signature = sign_message(checksum, "default")
-        mut sigfile = path_join(project_root, ".taupkg/" + manifest.name + "-" + manifest.version + ".sig")
+        mut sigfile = path_join(project_root, "taupkg.sig")
         File.write_text(sigfile, "pubkey = \"" + signer_pk + "\"\nsignature = \"" + signature + "\"\nchecksum = \"" + checksum + "\"\n")
-        print("Signed with ed25519 key (public: " + signer_pk + ")")
+        print("Signed with ed25519 key (public: " + signer_pk + ") → taupkg.sig")
     else:
         print("note: no signing key ('taupkg key gen' to create one) — publishing unsigned.")
 
@@ -663,7 +667,34 @@ def cmd_audit(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose
         else:
             print("FOUND: " + str(vulns) + " known vulnerability(ies) — see above.")
 
-    if bad == 0 and vulns == 0:
+    # Signature verification: any package shipping a taupkg.sig is checked against
+    # the trusted-keys set. An invalid signature fails the audit; a valid-but-
+    # untrusted signature is a warning (run `taupkg key trust <pubkey>`).
+    mut signed = 0
+    mut untrusted = 0
+    mut sig_bad = 0
+    mut si = 0
+    while si < lockfile.packages.len:
+        mut sp = lockfile.packages.get(si)
+        si = si + 1
+        mut sdir = path_join(project_pkg_dir(project_root), sp.name)
+        mut st = verify_package(sdir)
+        if st == 0: continue
+        signed = signed + 1
+        if st == 1:
+            print("  ✓ " + sp.name + "@" + sp.version + " signature valid (trusted key)")
+        elif st == 2:
+            print("  ~ " + sp.name + "@" + sp.version + " signature valid but key NOT trusted: " + package_signer(sdir))
+            print("      run: taupkg key trust " + package_signer(sdir))
+            untrusted = untrusted + 1
+        else:
+            print("  ! " + sp.name + "@" + sp.version + " signature INVALID (tampered or wrong key)")
+            sig_bad = sig_bad + 1
+    if signed > 0:
+        print("")
+        print("Signatures: " + str(signed) + " signed, " + str(sig_bad) + " invalid, " + str(untrusted) + " untrusted.")
+
+    if bad == 0 and vulns == 0 and sig_bad == 0:
         return 0
     return 1
 

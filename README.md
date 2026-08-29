@@ -393,6 +393,13 @@ and offers two commands on top:
   taupkg key trust <pubkey> --name alice
   ```
 
+  `publish` drops a `taupkg.sig` (pubkey + signature + checksum) at the package
+  root; it ships with the package and is excluded from the content hash it
+  certifies. On the consumer side, **`taupkg audit` verifies each signed package**
+  against your trusted keys — a valid signature from a trusted key passes, a valid
+  signature from an untrusted key warns, and a tampered package fails (both the
+  integrity checksum and the signature catch it).
+
   Signatures are ed25519 (RFC 8032) via a pure-C TweetNaCl implementation in the
   Tauraro runtime; keys are 32-byte seeds (64-hex), signatures 64 bytes (128-hex).
 
@@ -552,9 +559,12 @@ app 0.1.0
 taupkg audit
 ```
 
-Re-hash every installed package and verify it against the checksum in
-`taupkg.lock` (integrity), then check every package against the advisory database
-(vulnerabilities). Exits non-zero if either fails. See [Security](#security).
+Runs three checks and exits non-zero if any fails. See [Security](#security):
+
+1. **integrity** — re-hash every installed package vs. the `taupkg.lock` checksum,
+2. **advisories** — match installed versions against the advisory database,
+3. **signatures** — verify any package shipping a `taupkg.sig` against your
+   trusted keys (valid+trusted ✓, valid-but-untrusted `~` warning, invalid `!`).
 
 ```
 Auditing 2 locked package(s)...
@@ -562,6 +572,9 @@ OK: integrity verified -- all installed packages match the lock.
 
 Checking 2 package(s) against 1 advisory(ies)...
 OK: no known vulnerabilities.
+
+  ✓ shared@1.5.0 signature valid (trusted key)
+Signatures: 1 signed, 0 invalid, 0 untrusted.
 ```
 
 ---
