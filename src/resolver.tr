@@ -1,0 +1,354 @@
+# Dependency resolver — builds the FULL transitive graph and unifies every
+# package to a single version.
+#
+# Tauraro's unity build links exactly ONE copy of each module, so taupkg resolves
+# each package to a single version (unlike Cargo, which keeps multiple majors
+# side-by-side). To make that constraint bite as rarely as possible, the resolver:
+#
+#   1. accumulates EVERY constraint on a package across the whole graph (not just
+#      the first one it happens to see), and
+#   2. selects the highest version satisfying the INTERSECTION of all of them,
+#      re-selecting and re-walking to a fixpoint when a later constraint tightens
+#      (backtracking version selection), and
+#   3. when no single version can satisfy everyone, emits a world-class conflict
+#      report listing every constraint, who imposed it, the available versions,
+#      and concrete fixes.
+#
+# For path/git/archive sources (a single available version) selection degrades to
+# validating that fixed version against all constraints; for registry sources the
+# full version list drives selection and backtracking.
+
+from std.io import File
+from util import path_join, project_pkg_dir, path_resolve, path_relative
+from manifest import Manifest
+from lockfile import Lockfile, LockedPkg
+from semver import Version
+from source import dep_constraint, parse_source
+from installer import install_package, install_from_lock
+from registry import registry_fetch_versions
+
+# Rebase a local `path` dependency source against `base_dir` (the directory of the
+# manifest that DECLARES it), yielding an absolute `local:<abs>` source.
+def rebase_source(name: str, src: str, base_dir: str) -> str:
+    mut ps = parse_source(name, src)
+    if ps.kind == "local":
+        return "local:" + path_resolve(base_dir, ps.uri)
+    return src
+
+# The directory a resolved package's OWN transitive deps are anchored to.
+def origin_dir_of(name: str, src: str, project_root: str) -> str:
+    mut ps = parse_source(name, src)
+    if ps.kind == "local":
+        return ps.uri
+    return path_join(project_pkg_dir(project_root), name)
+
+
+# One resolved node in the dependency graph.
+pub class ResolvedDep:
+    pub name: str
+    pub version: str
+    pub constraint: str
+    pub source: str
+    pub checksum: str
+    pub requested_by: str
+    pub depth: int
+    pub edges: Vec[str]
+
+extend ResolvedDep:
+    pub def init(name: str, version: str, constraint: str, source: str, checksum: str, requested_by: str, depth: int) -> ResolvedDep:
+        mut d = ResolvedDep()
+        d.name         = name
+        d.version      = version
+        d.constraint   = constraint
+        d.source       = source
+        d.checksum     = checksum
+        d.requested_by = requested_by
+        d.depth        = depth
+        d.edges        = Vec[str].init(4)
+        return d
+
+    pub def to_locked(self) -> LockedPkg:
+        mut lp = LockedPkg.init(self.name, self.version, self.source, self.checksum)
+        lp.constraint = self.constraint
+        return lp
+
+
+pub class Resolution:
+    pub ok: bool
+    pub error: str
+    pub order: Vec[str]
+    pub by_name: Map[str, ResolvedDep]
+    pub root_deps: Vec[str]
+
+extend Resolution:
+    pub def init() -> Resolution:
+        mut r = Resolution()
+        r.ok        = true
+        r.error     = ""
+        r.order     = Vec[str].init(16)
+        r.by_name   = Map[str, ResolvedDep].init(16)
+        r.root_deps = Vec[str].init(8)
+        return r
+
+    pub def to_lockfile(self) -> Lockfile:
+        mut lf = Lockfile.init()
+        mut i = 0
+        while i < self.order.len:
+            mut nm = self.order.get(i)
+            i = i + 1
+            if self.by_name.contains(nm):
+                lf.packages.push(self.by_name.get(nm).to_locked())
+        return lf
+
+
+# ── constraint helpers ────────────────────────────────────────────────────────
+
+# Append val to a newline-delimited list stored under key. Constraints and
+# package names never contain newlines. (A newline-joined string avoids mutating
+# a Vec THROUGH a map-interior borrow, which the borrow checker rejects [M-4].)
+def _accum(m: Map[str, str], key: str, val: str):
+    if m.contains(key):
+        mut prev = m.get(key) + ""      # own a copy, breaking the borrow into m
+        m.insert(key, prev + "\n" + val)
+    else:
+        m.insert(key, val)
+
+# Split a newline-delimited list back into a Vec (skips empty segments).
+def _split(s: str) -> Vec[str]:
+    mut out = Vec[str].init(4)
+    for part in s.split("\n"):
+        if part.len() > 0: out.push(part)
+    return out
+
+# True iff `vstr` satisfies every constraint in `cons`.
+def _satisfies_all(vstr: str, cons: Vec[str]) -> bool:
+    mut v = Version.init(vstr)
+    mut i = 0
+    while i < cons.len:
+        if not v.satisfies(cons.get(i)): return false
+        i = i + 1
+    return true
+
+# Highest version in `versions` satisfying every constraint in `cons` ("" if none).
+def _best_for_all(versions: Vec[str], cons: Vec[str]) -> str:
+    mut best = ""
+    mut best_v = Version.init("0.0.0")
+    mut i = 0
+    while i < versions.len:
+        mut vs = versions.get(i)
+        if _satisfies_all(vs, cons):
+            mut v = Version.init(vs)
+            if best == "" or v.gt(best_v):
+                best = vs
+                best_v = v
+        i = i + 1
+    return best
+
+# Format "name X.Y.Z" when the version is known, else just "name".
+def _who(res: Resolution, who: str) -> str:
+    if who == "(root)" or who == "(dev)": return who
+    if res.by_name.contains(who):
+        return who + " " + res.by_name.get(who).version
+    return who
+
+# Build a world-class conflict report for a single package.
+def _conflict_report(res: Resolution, name: str, cons: Vec[str], reqs: Vec[str], resolved_ver: str, src: str, avail: Vec[str]) -> str:
+    mut ps = parse_source(name, src)
+    mut r = "cannot select a single version of '" + name + "'\n\n"
+    r = r + "  '" + name + "' is required by:\n"
+    mut i = 0
+    while i < cons.len:
+        mut c = cons.get(i)
+        if c == "": c = "*"
+        r = r + "    - " + _who(res, reqs.get(i)) + "  requires  " + c + "\n"
+        i = i + 1
+    r = r + "\n"
+    if ps.kind == "local" or ps.kind == "git" or ps.kind == "github" or ps.kind == "archive":
+        # A single-version source cannot offer an alternative.
+        r = r + "  '" + name + "' resolves to " + resolved_ver + " from " + src + ",\n"
+        r = r + "  which does not satisfy all of the above. A " + ps.kind + " source provides\n"
+        r = r + "  exactly one version, so the constraints must agree with it.\n"
+    else:
+        if avail.len > 0:
+            r = r + "  Available versions: " + _join(avail, ", ") + "\n"
+        r = r + "  No single version satisfies all constraints simultaneously.\n"
+    r = r + "\n"
+    r = r + "  Tauraro links exactly one copy of each package, so every dependent must\n"
+    r = r + "  agree on one version of '" + name + "'. To fix:\n"
+    r = r + "    - relax a constraint so a shared version exists, or\n"
+    r = r + "    - pin it explicitly in [deps]:  " + name + " = \"<version>\", or\n"
+    r = r + "    - if two incompatible majors are genuinely needed, they cannot coexist\n"
+    r = r + "      in one build — split the dependency or vendor one under a new name.\n"
+    return r
+
+def _join(v: Vec[str], sep: str) -> str:
+    mut out = ""
+    mut i = 0
+    while i < v.len:
+        if i > 0: out = out + sep
+        out = out + v.get(i)
+        i = i + 1
+    return out
+
+
+# ── the resolver ──────────────────────────────────────────────────────────────
+
+pub def resolve(root: Manifest, project_root: str, lock: Lockfile, include_dev: bool, locked: bool, offline: bool, verbose: bool) -> Resolution:
+    # Persistent assignment across fixpoint passes.
+    mut chosen_ver: Map[str, str]        = Map[str, str].init(16)   # name -> selected version
+    mut installed_at: Map[str, str]      = Map[str, str].init(16)   # name -> version on disk
+    mut versions_cache: Map[str, Vec[str]] = Map[str, Vec[str]].init(8)  # registry name -> versions
+    mut src_of: Map[str, str]            = Map[str, str].init(16)   # name -> resolved source
+
+    mut res = Resolution.init()
+    mut pass_no = 0
+    while pass_no < 64:
+        pass_no = pass_no + 1
+
+        # Per-pass state: re-walk the graph under the current assignment.
+        res = Resolution.init()
+        mut cons: Map[str, str] = Map[str, str].init(16)   # name -> "c1\nc2\n..."
+        mut reqs: Map[str, str] = Map[str, str].init(16)   # name -> "r1\nr2\n..."
+
+        # Worklist as parallel Vecs.
+        mut w_name = Vec[str].init(32)
+        mut w_con  = Vec[str].init(32)
+        mut w_src  = Vec[str].init(32)
+        mut w_req  = Vec[str].init(32)
+        mut w_dep  = Vec[int].init(32)
+        mut w_base = Vec[str].init(32)
+
+        for name in root.deps.keys():
+            mut raw = root.deps.get(name)
+            mut s0 = raw
+            if root.sources.contains(name): s0 = root.sources.get(name)
+            w_name.push(name); w_con.push(dep_constraint(s0)); w_src.push(s0); w_req.push("(root)"); w_dep.push(1); w_base.push(project_root)
+            res.root_deps.push(name)
+        if include_dev:
+            for name in root.dev_deps.keys():
+                mut raw = root.dev_deps.get(name)
+                mut s0 = raw
+                if root.sources.contains(name): s0 = root.sources.get(name)
+                w_name.push(name); w_con.push(dep_constraint(s0)); w_src.push(s0); w_req.push("(dev)"); w_dep.push(1); w_base.push(project_root)
+                res.root_deps.push(name)
+
+        mut head  = 0
+        mut guard = 0
+        mut fatal = ""
+        while head < w_name.len and guard < 40000:
+            guard = guard + 1
+            mut name    = w_name.get(head)
+            mut con     = w_con.get(head)
+            mut raw_src = w_src.get(head)
+            mut req     = w_req.get(head)
+            mut depth   = w_dep.get(head)
+            mut base    = w_base.get(head)
+            head = head + 1
+
+            mut src = rebase_source(name, raw_src, base)
+            _accum(cons, name, con)
+            _accum(reqs, name, req)
+
+            # Already handled this pass? Just keep accumulating constraints.
+            if res.by_name.contains(name): continue
+
+            # ── choose a version ─────────────────────────────────────────────
+            mut ps = parse_source(name, src)
+            mut want_ver = ""
+            if locked:
+                if not lock.has(name):
+                    fatal = "--locked: '" + name + "' is not in taupkg.lock — run `taupkg install` to refresh the lock."
+                    head = w_name.len
+                    continue
+                want_ver = lock.find(name).version
+            elif chosen_ver.contains(name):
+                want_ver = chosen_ver.get(name)          # keep the assignment from a prior pass
+            elif ps.kind == "registry" and not offline:
+                # First selection for a registry dep: pick from the full version list.
+                if not versions_cache.contains(name):
+                    versions_cache.insert(name, registry_fetch_versions(name))
+                want_ver = _best_for_all(versions_cache.get(name), _split(cons.get(name)))
+
+            # ── install / fetch at the wanted version ───────────────────────
+            mut pkg = LockedPkg.init("", "", "", "")
+            if locked:
+                pkg = install_from_lock(lock.find(name), project_root, offline, verbose)
+            elif ps.kind == "registry" and want_ver != "":
+                if (not installed_at.contains(name)) or installed_at.get(name) != want_ver:
+                    pkg = install_package(name, want_ver, src, project_root, verbose)   # exact version
+                else:
+                    pkg = install_package(name, want_ver, src, project_root, verbose)
+            else:
+                # Single-version source (path/git/archive) or offline: one available version.
+                pkg = install_package(name, con, src, project_root, verbose)
+
+            if pkg.name.len() == 0:
+                fatal = "failed to resolve '" + name + "' (" + con + ") requested by " + _who(res, req)
+                head = w_name.len
+                continue
+
+            chosen_ver.insert(name, pkg.version)
+            installed_at.insert(name, pkg.version)
+            src_of.insert(name, src)
+
+            mut rec_source = pkg.source
+            if src.starts_with("local:"):
+                rec_source = "local:" + path_relative(project_root, src.slice(6, src.len()))
+            mut rd = ResolvedDep.init(name, pkg.version, con, rec_source, pkg.checksum, req, depth)
+
+            mut child_base = origin_dir_of(name, src, project_root)
+            mut sub_toml = path_join(path_join(project_pkg_dir(project_root), name), "taupkg.toml")
+            if File.file_exists(sub_toml):
+                mut sub = Manifest.load(sub_toml)
+                for dn in sub.deps.keys():
+                    mut draw = sub.deps.get(dn)
+                    mut dsrc = draw
+                    if sub.sources.contains(dn): dsrc = sub.sources.get(dn)
+                    rd.edges.push(dn)
+                    w_name.push(dn); w_con.push(dep_constraint(dsrc)); w_src.push(dsrc); w_req.push(name); w_dep.push(depth + 1); w_base.push(child_base)
+
+            res.by_name.insert(name, rd)
+            res.order.push(name)
+
+        if fatal != "":
+            res.ok = false
+            res.error = fatal
+            return res
+
+        # ── validate the assignment against ALL accumulated constraints ──────
+        # A package whose chosen version fails some constraint is re-selected
+        # (registry) — which triggers another pass so its new deps are re-walked —
+        # or reported as a conflict (single-version source, or no compatible
+        # registry version exists).
+        mut changed = false
+        mut oi = 0
+        while oi < res.order.len:
+            mut nm = res.order.get(oi)
+            oi = oi + 1
+            mut cl = _split(cons.get(nm))
+            mut cur = chosen_ver.get(nm)
+            if _satisfies_all(cur, cl): continue
+
+            mut nsrc = src_of.get(nm)
+            mut nps = parse_source(nm, nsrc)
+            mut resolved = false
+            if nps.kind == "registry" and versions_cache.contains(nm):
+                mut nv = _best_for_all(versions_cache.get(nm), cl)
+                if nv != "" and nv != cur:
+                    chosen_ver.insert(nm, nv)
+                    changed = true
+                    resolved = true
+            if not resolved:
+                mut avail = Vec[str].init(1)
+                if versions_cache.contains(nm): avail = versions_cache.get(nm)
+                res.ok = false
+                res.error = _conflict_report(res, nm, cl, _split(reqs.get(nm)), cur, nsrc, avail)
+                return res
+
+        if not changed:
+            return res    # fixpoint reached, no conflicts
+
+    # Safety valve: too many passes (should never happen for a finite graph).
+    res.ok = false
+    res.error = "resolver did not converge after 64 passes — likely a dependency cycle with shifting constraints."
+    return res

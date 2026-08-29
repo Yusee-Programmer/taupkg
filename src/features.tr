@@ -1,0 +1,81 @@
+# Cargo-style feature resolution for taupkg.
+#
+# [features] maps a feature name to a comma-separated list of things it enables —
+# other features and/or optional dependency names:
+#
+#   [features]
+#   default = "json"
+#   json    = "serde"          # enabling `json` pulls in the optional dep `serde`
+#   full    = "json, tls"      # a feature can enable other features
+#   tls     = "openssl"
+#
+# A dependency is optional when declared `{ ..., optional = true }`. Optional deps
+# are excluded from the build unless an enabled feature names them. This module
+# expands the enabled feature set (default + --features + --all-features, minus
+# --no-default-features) and returns the manifest with disabled optional deps
+# removed, so the resolver only ever sees deps that should actually be built.
+
+from manifest import Manifest
+from source import dep_is_optional
+
+# Expand `requested` features (plus defaults, unless suppressed) transitively into
+# the set of enabled optional-dependency NAMES.
+def _enabled_dep_set(m: Manifest, requested: Vec[str], use_default: bool, all: bool) -> Map[str, bool]:
+    mut seen_feat: Map[str, bool] = Map[str, bool].init(8)
+    mut enabled_dep: Map[str, bool] = Map[str, bool].init(8)
+
+    # Worklist of feature/dep tokens to expand.
+    mut work = Vec[str].init(8)
+    if all:
+        for fk in m.features.keys():
+            work.push(fk)
+    else:
+        if use_default and m.default_features.len() > 0:
+            for d in m.default_features.split(","):
+                mut t = d.trim()
+                if t.len() > 0: work.push(t)
+        mut i = 0
+        while i < requested.len:
+            work.push(requested.get(i))
+            i = i + 1
+
+    mut head = 0
+    mut guard = 0
+    while head < work.len and guard < 10000:
+        guard = guard + 1
+        mut item = work.get(head)
+        head = head + 1
+        if item == "default": continue          # already handled via default_features
+        if m.features.contains(item):
+            if seen_feat.contains(item): continue
+            seen_feat.insert(item, true)
+            for x in m.features.get(item).split(","):
+                mut t = x.trim()
+                if t.len() > 0: work.push(t)
+        else:
+            # not a feature name → it's an optional dependency to enable
+            enabled_dep.insert(item, true)
+    return enabled_dep
+
+# Return `m` with optional deps that are NOT enabled removed from [deps].
+# Non-optional deps always stay. Mutates and returns the manifest.
+pub def apply_features(m: Manifest, requested: Vec[str], use_default: bool, all: bool) -> Manifest:
+    mut enabled = _enabled_dep_set(m, requested, use_default, all)
+    mut newdeps: Map[str, str] = Map[str, str].init(8)
+    for k in m.deps.keys():
+        mut raw = m.deps.get(k)
+        if dep_is_optional(raw):
+            if enabled.contains(k):
+                newdeps.insert(k, raw)
+        else:
+            newdeps.insert(k, raw)
+    m.deps = newdeps
+    return m
+
+# Parse a comma-separated --features value into a Vec of feature names.
+pub def parse_feature_list(s: str) -> Vec[str]:
+    mut out = Vec[str].init(4)
+    for part in s.split(","):
+        mut t = part.trim()
+        if t.len() > 0: out.push(t)
+    return out

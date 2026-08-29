@@ -1,7 +1,7 @@
 # taupkg -- Tauraro package manager
 # Entry point: command dispatch.
 
-from std.io import File
+from std.io import File, Dir
 from std.os import OS, Process, Env
 from cli import parse_args, print_usage, CliArgs
 from manifest import Manifest
@@ -9,21 +9,32 @@ from lockfile import Lockfile, LockedPkg
 from semver import Version
 from source import parse_source
 from installer import install_package
-from builder import build_project, run_binary, find_compiler
+from resolver import resolve, Resolution, ResolvedDep
+from builder import build_project, run_binary, find_compiler, tauraro_path_value, apply_tauraro_path
 from registry import registry_search
-from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf
+from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf, credentials_path, taupkg_home, hash_tree, shell_quote, shell_run, path_resolve
+from security import generate_sbom, load_advisories, audit_advisories
+from features import apply_features, parse_feature_list
+from signing import key_generate, key_pubkey, sign_message, verify_message, trust_key, is_trusted, key_path, verify_package, package_signer
+from progress import check, header, fmt_bytes
 from tauraro_install import install_tauraro
+from bindgen_cmd import cmd_bindgen
 
 def main(argv: Vec[str]):
     mut args = parse_args(argv)
     mut verbose = args.flag("verbose") or args.flag("v")
+
+    # `bindgen` is dispatched first: it parses its own raw argv (so `-h cpp` for
+    # C++ mode is not mistaken for `-h` help) and needs no project taupkg.toml.
+    if args.command == "bindgen":
+        return cmd_bindgen(argv, OS.cwd(), verbose)
 
     if args.command == "" or args.command == "help" or args.flag("help") or args.flag("h"):
         print_usage()
         return 0
 
     if args.command == "version":
-        print("taupkg 0.0.1")
+        print("taupkg 0.0.2")
         return 0
 
     if args.command == "install-tauraro":
@@ -37,6 +48,15 @@ def main(argv: Vec[str]):
     if args.command == "search":
         return cmd_search(args)
 
+    if args.command == "key":
+        return cmd_key(args)
+
+    if args.command == "sign":
+        return cmd_sign(args)
+
+    if args.command == "verify":
+        return cmd_verify(args)
+
     # All remaining commands need a project root with taupkg.toml
     mut cwd = OS.cwd()
     mut project_root = find_project_root(cwd)
@@ -46,6 +66,14 @@ def main(argv: Vec[str]):
         return 1
 
     mut manifest = Manifest.load(manifest_path)
+
+    # Workspace: fan out multi-member commands before the single-package validity
+    # check (a virtual workspace manifest may have no [package]).
+    if manifest.is_workspace():
+        mut wc = args.command
+        if wc == "install" or wc == "build" or wc == "test" or wc == "tree":
+            return cmd_workspace(wc, args, manifest, project_root, verbose)
+
     if not manifest.is_valid():
         print("error: invalid taupkg.toml -- 'name' and 'version' are required")
         return 1
@@ -53,8 +81,20 @@ def main(argv: Vec[str]):
     mut lock_path = path_join(project_root, "taupkg.lock")
     mut lockfile  = Lockfile.load(lock_path)
 
+    if args.command == "login":
+        return cmd_login(args)
+
     if args.command == "install":
-        return cmd_install(manifest, lockfile, lock_path, project_root, verbose)
+        return cmd_install(args, manifest, lockfile, lock_path, project_root, verbose)
+
+    if args.command == "tree":
+        return cmd_tree(manifest, lockfile, project_root, verbose)
+
+    if args.command == "audit":
+        return cmd_audit(manifest, lockfile, project_root, verbose)
+
+    if args.command == "sbom":
+        return cmd_sbom(args, manifest, lockfile, project_root)
 
     if args.command == "add":
         return cmd_add(args, manifest, manifest_path, lockfile, lock_path, project_root, verbose)
@@ -74,6 +114,9 @@ def main(argv: Vec[str]):
             return rc
         return run_binary(project_root, manifest, args.passthrough)
 
+    if args.command == "env":
+        return cmd_env(manifest, lockfile, project_root)
+
     if args.command == "test":
         return cmd_test(manifest, lockfile, project_root, verbose)
 
@@ -89,7 +132,7 @@ def main(argv: Vec[str]):
         return 0
 
     if args.command == "publish":
-        return cmd_publish(manifest, manifest_path, project_root, verbose)
+        return cmd_publish(args, manifest, manifest_path, project_root, verbose)
 
     print("error: unknown command '" + args.command + "'. Run `taupkg help` for usage.")
 
@@ -136,63 +179,39 @@ def cmd_init(args: CliArgs) -> int:
 
 # -- install --------------------------------------------------------------------
 
-def cmd_install(manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
-    mut changed = false
-    mut failed = false
+def cmd_install(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
+    mut locked  = args.flag("locked") or args.flag("frozen")
+    mut offline = args.flag("offline")
 
-    # Iterate deps via a Vec of (name, constraint) pairs we build from manifest.deps
-    # (Map has no iterator, so we resolve by looking at lockfile entries first then fresh deps)
-    # Note: we can't enumerate Map keys directly -- instead we iterate over lockfile entries
-    # and also process any dep names we received via the manifest sections object.
-    # For now, we read the raw toml dep section again to get the keys.
-    mut dep_names  = _collect_dep_names(manifest, project_root)
+    # Feature gating: drop optional deps not enabled by the selected features.
+    apply_features(manifest, parse_feature_list(args.flag_val("features", "")), not args.flag("no-default-features"), args.flag("all-features"))
 
-    mut i = 0
-    while i < dep_names.len:
-        mut dep_name = dep_names.get(i)
-        mut constraint = "*"
-        if manifest.deps.contains(dep_name):
-            constraint = manifest.deps.get(dep_name)
-        mut source_uri = constraint
-        if manifest.sources.contains(dep_name):
-            source_uri = manifest.sources.get(dep_name)
-
-        # Check lockfile -- use locked version if it satisfies constraint
-        if lockfile.has(dep_name):
-            mut locked = lockfile.find(dep_name)
-            mut v = Version.init(locked.version)
-            if v.satisfies(constraint) and File.dir_exists(path_join(project_pkg_dir(project_root), dep_name)):
-                if verbose:
-                    print("  " + dep_name + "@" + locked.version + " (locked, up-to-date)")
-                i = i + 1
-                continue
-
-        if verbose:
-            print("Installing " + dep_name + " " + constraint + "...")
-        else:
-            print("Installing " + dep_name + "...")
-
-        mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
-        if pkg.name.len() == 0:
-            failed = true
-        else:
-            lockfile.upsert(pkg)
-            changed = true
-            print("  + " + dep_name + "@" + pkg.version)
-
-        i = i + 1
-
-    if changed:
-        lockfile.save(lock_path)
-
-    if failed:
-        print("Some packages failed to install.")
+    # In --locked mode we replay the existing lock exactly (CI-reproducible). Otherwise we resolve the
+    # FULL transitive graph fresh and (re)write the lock. Dev-deps are resolved for the top-level project
+    # so `test`/examples work; they are NOT propagated to consumers.
+    mut res = resolve(manifest, project_root, lockfile, true, locked, offline, verbose)
+    if not res.ok:
+        print("error: " + res.error)
         return 1
 
-    if dep_names.len == 0:
+    if res.order.len == 0:
         print("No dependencies to install.")
-    else:
-        print("All packages installed.")
+        return 0
+
+    # Report the resolved graph.
+    header("Installed " + str(res.order.len) + " package(s)")
+    mut i = 0
+    while i < res.order.len:
+        mut nm = res.order.get(i)
+        i = i + 1
+        if res.by_name.contains(nm):
+            mut d = res.by_name.get(nm)
+            check(d.name, d.version)
+
+    # In --locked mode the lock is authoritative; otherwise persist the freshly-resolved graph.
+    if not locked:
+        mut new_lock = res.to_lockfile()
+        new_lock.save(lock_path)
     return 0
 
 
@@ -280,34 +299,22 @@ def cmd_remove(args: CliArgs, manifest: Manifest, manifest_path: str, lockfile: 
 # -- update ---------------------------------------------------------------------
 
 def cmd_update(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path: str, project_root: str, verbose: bool) -> int:
-    mut target = args.first_pos()  # "" = update all
-
-    mut dep_names = _collect_dep_names(manifest, project_root)
-    mut changed = false
+    # `update` IGNORES the lock (locked=false) and re-resolves the whole graph to the newest compatible
+    # versions, then rewrites the lock. (A `<pkg>` argument updating only one package while keeping the
+    # rest pinned is a planned refinement — for now `update` refreshes the entire graph.)
+    mut res = resolve(manifest, project_root, lockfile, true, false, false, verbose)
+    if not res.ok:
+        print("error: " + res.error)
+        return 1
     mut i = 0
-    while i < dep_names.len:
-        mut dep_name = dep_names.get(i)
-        if target.len() > 0 and dep_name != target:
-            i = i + 1
-            continue
-
-        mut constraint = "*"
-        if manifest.deps.contains(dep_name):
-            constraint = manifest.deps.get(dep_name)
-        mut source_uri = constraint
-        if manifest.sources.contains(dep_name):
-            source_uri = manifest.sources.get(dep_name)
-
-        print("Updating " + dep_name + "...")
-        mut pkg = install_package(dep_name, constraint, source_uri, project_root, verbose)
-        if pkg.name.len() > 0:
-            lockfile.upsert(pkg)
-            changed = true
-            print("  -> " + dep_name + "@" + pkg.version)
+    while i < res.order.len:
+        mut nm = res.order.get(i)
         i = i + 1
-
-    if changed:
-        lockfile.save(lock_path)
+        if res.by_name.contains(nm):
+            mut d = res.by_name.get(nm)
+            print("  -> " + d.name + "@" + d.version)
+    res.to_lockfile().save(lock_path)
+    print("Updated to newest compatible versions.")
     return 0
 
 
@@ -316,11 +323,81 @@ def cmd_update(args: CliArgs, manifest: Manifest, lockfile: Lockfile, lock_path:
 def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
     mut release = args.flag("release")
     mut output  = args.flag_val("o", "")
-    mut ok = build_project(project_root, manifest, lockfile, output, release, verbose)
+    mut target  = args.flag_val("target", "")   # zero-config cross-compile (tauraroc bundles zig cc)
+    mut sandbox = args.flag("sandbox")          # hermetic fallback: copy into .taupkg/build/
+
+    # Feature gating: drop optional deps not enabled by the selected features.
+    apply_features(manifest, parse_feature_list(args.flag_val("features", "")), not args.flag("no-default-features"), args.flag("all-features"))
+
+    # Make sure the full transitive graph is present before compiling. If a lock exists, replay it
+    # (installing anything missing, verifying checksums); otherwise resolve fresh.
+    mut has_lock = lockfile.packages.len > 0
+    mut res = resolve(manifest, project_root, lockfile, false, has_lock, false, verbose)
+    if not res.ok:
+        print("error: " + res.error)
+        return 1
+    mut eff_lock = res.to_lockfile()
+    if not has_lock and eff_lock.packages.len > 0:
+        eff_lock.save(path_join(project_root, "taupkg.lock"))
+
+    mut ok = build_project(project_root, manifest, eff_lock, output, release, target, sandbox, verbose)
     if ok:
         print("Build succeeded.")
         return 0
     return 1
+
+
+# -- workspace ------------------------------------------------------------------
+# Fan a command out across every [workspace] member. Each member is a normal
+# taupkg package (its own taupkg.toml + src) resolved/built in its own directory;
+# path deps between members resolve via the usual per-manifest rebasing.
+def cmd_workspace(cmd: str, args: CliArgs, root: Manifest, project_root: str, verbose: bool) -> int:
+    mut n = root.workspace_members.len
+    print("Workspace: " + str(n) + " member(s)")
+    mut rc = 0
+    mut i = 0
+    while i < n:
+        mut member = root.workspace_members.get(i)
+        i = i + 1
+        mut mdir = path_resolve(project_root, member)
+        mut mtoml = path_join(mdir, "taupkg.toml")
+        if not File.file_exists(mtoml):
+            print("  ! member '" + member + "' has no taupkg.toml — skipping")
+            rc = 1
+            continue
+        mut mman = Manifest.load(mtoml)
+        mut mlock_path = path_join(mdir, "taupkg.lock")
+        mut mlock = Lockfile.load(mlock_path)
+        print("")
+        print("== " + mman.name + "  (" + member + ") ==")
+        mut r = 0
+        if cmd == "install":
+            r = cmd_install(args, mman, mlock, mlock_path, mdir, verbose)
+        elif cmd == "build":
+            r = cmd_build(args, mman, mlock, mdir, verbose)
+        elif cmd == "test":
+            r = cmd_test(mman, mlock, mdir, verbose)
+        elif cmd == "tree":
+            r = cmd_tree(mman, mlock, mdir, verbose)
+        if r != 0: rc = r
+    return rc
+
+
+# -- env ------------------------------------------------------------------------
+# Print the TAURARO_PATH line for compiling this project with `tauraroc` directly
+# (taupkg build sets it automatically; this is the manual escape hatch). Shell-
+# appropriate so it can be eval'd: `eval "$(taupkg env)"` on POSIX.
+def cmd_env(manifest: Manifest, lockfile: Lockfile, project_root: str) -> int:
+    mut val = tauraro_path_value(project_root, lockfile)
+    if val.len() == 0:
+        print("# taupkg: no dependencies installed — TAURARO_PATH is not needed here.")
+        return 0
+    if OS.is_windows():
+        print("set TAURARO_PATH=" + val)
+        print("# PowerShell:  $env:TAURARO_PATH = \"" + val + "\"")
+    else:
+        print("export TAURARO_PATH=\"" + val + "\"")
+    return 0
 
 
 # -- test -----------------------------------------------------------------------
@@ -332,20 +409,58 @@ def cmd_test(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose:
         print("No tests/ directory found.")
         return 0
 
-    # Find test files: tests/test_*.tr
-    mut rc = Process.system("ls \"" + test_dir + "\"")  # for now just check dir is non-empty
-    # TODO: When tau gets a built-in test runner, delegate here.
-    # For now, compile and run each test_*.tr file.
-    print("Running tests in " + test_dir + "...")
-    mut cmd = cc + " " + test_dir + "/test_*.tr -o .taupkg/test_runner"
-    if OS.is_windows():
-        cmd = cc + " \"" + test_dir + "\\test_all.tr\" -o \".taupkg\\test_runner.exe\""
-    mut result = Process.system(cmd)
-    if result != 0:
-        return result
-    if OS.is_windows():
-        return Process.system(".taupkg\\test_runner.exe")
-    return Process.system(".taupkg/test_runner")
+    # Tests import the project's deps too — set TAURARO_PATH automatically.
+    apply_tauraro_path(project_root, lockfile, verbose)
+
+    # Collect every `.tr` test file. A file passes iff it compiles, runs with
+    # exit code 0, and its output does not contain "FAILED".
+    mut entries = Dir.init(test_dir).list()
+    mut files = Vec[str].init(8)
+    mut e = 0
+    while e < entries.len:
+        mut nm = entries.get(e)
+        e = e + 1
+        if nm.ends_with(".tr"): files.push(nm)
+    if files.len == 0:
+        print("No .tr test files found in " + test_dir + ".")
+        return 0
+
+    mkdir_p(path_join(project_root, ".taupkg"))
+    print("Running " + str(files.len) + " test file(s)...")
+    mut passed = 0
+    mut failed = 0
+    mut k = 0
+    while k < files.len:
+        mut f = files.get(k)
+        k = k + 1
+        mut src = path_join(test_dir, f)
+        mut base = f
+        if base.ends_with(".tr"): base = base.slice(0, base.len() - 3)
+        mut outbin = path_join(project_root, ".taupkg/_test_" + base)
+        mut nul = "/dev/null"
+        if OS.is_windows():
+            outbin = outbin + ".exe"
+            nul = "nul"
+        mut crc = shell_run(shell_quote(cc) + " " + shell_quote(src) + " -o " + shell_quote(outbin) + " >" + nul + " 2>&1")
+        if crc != 0:
+            print("  FAIL (compile)  " + f)
+            failed = failed + 1
+            continue
+        # A test passes iff it runs and its output doesn't contain "FAILED"
+        # (the std.test TestRunner convention).
+        mut output = shell_capture(shell_quote(outbin))
+        if output.contains("FAILED"):
+            print("  FAIL            " + f)
+            failed = failed + 1
+        else:
+            print("  ok              " + f)
+            passed = passed + 1
+
+    print("")
+    print("Test files: " + str(files.len) + ", passed: " + str(passed) + ", failed: " + str(failed))
+    if failed > 0:
+        return 1
+    return 0
 
 
 # -- list -----------------------------------------------------------------------
@@ -394,22 +509,56 @@ def cmd_search(args: CliArgs) -> int:
 
 # -- publish --------------------------------------------------------------------
 
-def cmd_publish(manifest: Manifest, manifest_path: str, project_root: str, verbose: bool) -> int:
+def cmd_publish(args: CliArgs, manifest: Manifest, manifest_path: str, project_root: str, verbose: bool) -> int:
     from registry import registry_publish
-    # Create a tarball of the project src/
+    mut dry = args.flag("dry-run")
+
+    # ── pre-flight validation (fail early with clear guidance) ────────────────
+    mut problems = 0
+    if manifest.name.len() == 0:
+        print("error: [package].name is required to publish."); problems = problems + 1
+    if manifest.version.len() == 0:
+        print("error: [package].version is required to publish."); problems = problems + 1
+    mut src_dir = path_join(project_root, "src")
+    if not File.dir_exists(src_dir):
+        print("error: no src/ directory to publish."); problems = problems + 1
+    if problems > 0:
+        return 1
+
+    # Create a reproducible tarball of src/ + the manifest.
     mut tarball = path_join(project_root, ".taupkg/" + manifest.name + "-" + manifest.version + ".tar.gz")
     mkdir_p(path_join(project_root, ".taupkg"))
-    mut src_dir = path_join(project_root, "src")
-    mut cmd = ""
-    if OS.is_windows():
-        print("error: publish tarball creation not supported on Windows yet. Use WSL or git archive.")
-        return 1
-    else:
-        cmd = "tar -czf \"" + tarball + "\" -C \"" + project_root + "\" src/"
+    # `tar` ships with Windows 10+ (bsdtar) and every Unix, so one command works everywhere.
+    mut cmd = "tar -czf \"" + tarball + "\" -C \"" + project_root + "\" src taupkg.toml"
     mut rc = Process.system(cmd)
-    if rc != 0:
-        print("error: failed to create tarball")
+    if rc != 0 or not File.file_exists(tarball):
+        print("error: failed to create package tarball.")
         return 1
+
+    # Sign the package's whole-tree content checksum with the default key, if one
+    # exists, and drop a `taupkg.sig` at the package root. That file travels with
+    # the package (path/git/registry) and is what a consumer's `taupkg audit`
+    # verifies against the trusted-keys set. `taupkg.sig` is excluded from the
+    # hash, so its presence doesn't change the checksum it certifies.
+    mut checksum = hash_tree(project_root)
+    mut signer_pk = key_pubkey("default")
+    mut signature = ""
+    if signer_pk.len() > 0:
+        signature = sign_message(checksum, "default")
+        mut sigfile = path_join(project_root, "taupkg.sig")
+        File.write_text(sigfile, "pubkey = \"" + signer_pk + "\"\nsignature = \"" + signature + "\"\nchecksum = \"" + checksum + "\"\n")
+        print("Signed with ed25519 key (public: " + signer_pk + ") → taupkg.sig")
+    else:
+        print("note: no signing key ('taupkg key gen' to create one) — publishing unsigned.")
+
+    if dry:
+        print("Dry run: package '" + manifest.name + " " + manifest.version + "' is valid.")
+        print("  tarball: " + tarball)
+        print("  contents:")
+        Process.system("tar -tzf \"" + tarball + "\"")
+        print("Nothing was uploaded (--dry-run). Remove --dry-run to publish.")
+        return 0
+
     mut ok = registry_publish(manifest_path, tarball)
     if ok:
         print("Published " + manifest.name + " " + manifest.version)
@@ -442,34 +591,204 @@ pub def find_project_root(start_dir: str) -> str:
 
 # Re-parse the manifest TOML to get dep names as a Vec[str].
 # This exists because Map has no key-iteration; we parse the raw file.
-def _collect_dep_names(manifest: Manifest, project_root: str) -> Vec[str]:
-    from toml import toml_load
-    mut result = Vec[str].init(8)
-    mut toml_path = path_join(project_root, "taupkg.toml")
-    if not File.file_exists(toml_path):
-        return result
-    mut doc = toml_load(toml_path)
-    mut deps_sec = doc.get_section("deps")
-    # deps_sec.keys is a Map -- we cannot iterate it directly.
-    # Instead, compare against lockfile names + manifest dep names we know about.
-    # Best approach: re-read raw lines of the [deps] section.
-    mut content = File.read_text(toml_path)
-    mut lines = content.split("\n")
-    mut in_deps = false
+# -- tree -----------------------------------------------------------------------
+
+# Print the resolved dependency graph as an indented tree.
+def cmd_tree(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
+    mut has_lock = lockfile.packages.len > 0
+    mut res = resolve(manifest, project_root, lockfile, true, has_lock, false, verbose)
+    if not res.ok:
+        print("error: " + res.error)
+        return 1
+    print(manifest.name + " " + manifest.version)
     mut i = 0
-    while i < lines.len:
-        mut line = lines.get(i).trim()
-        if line == "[deps]" or line == "[dependencies]":
-            in_deps = true
-            i = i + 1
-            continue
-        if in_deps and line.starts_with("["):
-            in_deps = false
-        if in_deps and line.len() > 0 and not line.starts_with("#"):
-            mut eq = line.index_of("=")
-            if eq > 0:
-                mut name = line.slice(0, eq).trim()
-                if name.len() > 0:
-                    result.push(name)
+    while i < res.root_deps.len:
+        _print_tree_node(res, res.root_deps.get(i), "", i == res.root_deps.len - 1, 0)
         i = i + 1
-    return result
+    return 0
+
+def _print_tree_node(res: Resolution, name: str, prefix: str, last: bool, depth: int):
+    mut branch   = "|-- "
+    mut childpfx = "|   "
+    if last:
+        branch   = "`-- "
+        childpfx = "    "
+    if not res.by_name.contains(name):
+        print(prefix + branch + name + " (unresolved)")
+        return
+    mut d = res.by_name.get(name)
+    print(prefix + branch + d.name + " " + d.version)
+    if depth >= 40:
+        return   # cycle guard
+    mut i = 0
+    while i < d.edges.len:
+        _print_tree_node(res, d.edges.get(i), prefix + childpfx, i == d.edges.len - 1, depth + 1)
+        i = i + 1
+
+
+# -- audit ----------------------------------------------------------------------
+
+# Verify every installed package's content against its locked checksum (tamper/drift check).
+# A remote advisory-database check is a registry-v1 follow-up.
+def cmd_audit(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose: bool) -> int:
+    if lockfile.packages.len == 0:
+        print("No taupkg.lock found -- run `taupkg install` first.")
+        return 0
+    print("Auditing " + str(lockfile.packages.len) + " locked package(s)...")
+    mut bad = 0
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        i = i + 1
+        if p.checksum.len() == 0 or p.checksum == "none":
+            continue
+        mut dir = path_join(project_pkg_dir(project_root), p.name)
+        if not File.dir_exists(dir):
+            print("  ! " + p.name + "@" + p.version + " -- not installed")
+            bad = bad + 1
+            continue
+        if hash_tree(dir) != p.checksum:
+            print("  ! " + p.name + "@" + p.version + " -- checksum MISMATCH (tampered or modified)")
+            bad = bad + 1
+    if bad == 0:
+        print("OK: integrity verified -- all installed packages match the lock.")
+    else:
+        print("FAIL: " + str(bad) + " package(s) failed integrity verification.")
+
+    # Vulnerability check against the advisory database (project-local or global).
+    mut advisories = load_advisories(project_root)
+    mut vulns = 0
+    if advisories.len > 0:
+        print("")
+        print("Checking " + str(lockfile.packages.len) + " package(s) against " + str(advisories.len) + " advisory(ies)...")
+        vulns = audit_advisories(lockfile, advisories)
+        if vulns == 0:
+            print("OK: no known vulnerabilities.")
+        else:
+            print("FOUND: " + str(vulns) + " known vulnerability(ies) — see above.")
+
+    # Signature verification: any package shipping a taupkg.sig is checked against
+    # the trusted-keys set. An invalid signature fails the audit; a valid-but-
+    # untrusted signature is a warning (run `taupkg key trust <pubkey>`).
+    mut signed = 0
+    mut untrusted = 0
+    mut sig_bad = 0
+    mut si = 0
+    while si < lockfile.packages.len:
+        mut sp = lockfile.packages.get(si)
+        si = si + 1
+        mut sdir = path_join(project_pkg_dir(project_root), sp.name)
+        mut st = verify_package(sdir)
+        if st == 0: continue
+        signed = signed + 1
+        if st == 1:
+            print("  ✓ " + sp.name + "@" + sp.version + " signature valid (trusted key)")
+        elif st == 2:
+            print("  ~ " + sp.name + "@" + sp.version + " signature valid but key NOT trusted: " + package_signer(sdir))
+            print("      run: taupkg key trust " + package_signer(sdir))
+            untrusted = untrusted + 1
+        else:
+            print("  ! " + sp.name + "@" + sp.version + " signature INVALID (tampered or wrong key)")
+            sig_bad = sig_bad + 1
+    if signed > 0:
+        print("")
+        print("Signatures: " + str(signed) + " signed, " + str(sig_bad) + " invalid, " + str(untrusted) + " untrusted.")
+
+    if bad == 0 and vulns == 0 and sig_bad == 0:
+        return 0
+    return 1
+
+
+# -- sbom -----------------------------------------------------------------------
+# Emit a CycloneDX 1.5 SBOM of the resolved dependency graph.
+def cmd_sbom(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_root: str) -> int:
+    if lockfile.packages.len == 0:
+        print("No taupkg.lock found -- run `taupkg install` first.")
+        return 1
+    mut doc = generate_sbom(manifest, lockfile)
+    mut out = args.flag_val("o", "")
+    if out.len() > 0:
+        File.write_text(out, doc)
+        print("Wrote SBOM (" + str(lockfile.packages.len) + " components) to " + out)
+    else:
+        print(doc)
+    return 0
+
+
+# -- key / sign / verify (ed25519) ---------------------------------------------
+
+# `taupkg key gen|show|trust`
+def cmd_key(args: CliArgs) -> int:
+    mut sub = ""
+    if args.pos_args.len > 0: sub = args.pos_args.get(0)
+    mut name = args.flag_val("name", "default")
+
+    if sub == "gen" or sub == "generate":
+        mut pk = key_generate(name)
+        if pk.len() == 0:
+            print("error: key '" + name + "' already exists at " + key_path(name) + " (refusing to overwrite).")
+            return 1
+        print("Generated ed25519 keypair '" + name + "'.")
+        print("  private key: " + key_path(name) + "   (KEEP THIS SECRET)")
+        print("  public key:  " + pk)
+        print("Share the public key so others can `taupkg key trust " + pk + "`.")
+        return 0
+    if sub == "show" or sub == "pub":
+        mut pk = key_pubkey(name)
+        if pk.len() == 0:
+            print("error: no key '" + name + "'. Run `taupkg key gen`.")
+            return 1
+        print(pk)
+        return 0
+    if sub == "trust":
+        if args.pos_args.len < 2:
+            print("usage: taupkg key trust <pubkey> [--name <label>]")
+            return 1
+        mut pk = args.pos_args.get(1)
+        trust_key(pk, name)
+        print("Trusted public key '" + name + "': " + pk)
+        return 0
+    print("usage: taupkg key <gen|show|trust> [--name <id>]")
+    return 1
+
+# `taupkg sign <message> [--name <key>]` → print the detached signature.
+def cmd_sign(args: CliArgs) -> int:
+    if args.pos_args.len < 1:
+        print("usage: taupkg sign <message> [--name <key>]")
+        return 1
+    mut name = args.flag_val("name", "default")
+    mut sig = sign_message(args.pos_args.get(0), name)
+    if sig.len() == 0:
+        print("error: no key '" + name + "'. Run `taupkg key gen`.")
+        return 1
+    print(sig)
+    return 0
+
+# `taupkg verify <message> <signature> <pubkey>` → VALID / INVALID.
+def cmd_verify(args: CliArgs) -> int:
+    if args.pos_args.len < 3:
+        print("usage: taupkg verify <message> <signature> <pubkey>")
+        return 1
+    mut ok = verify_message(args.pos_args.get(0), args.pos_args.get(1), args.pos_args.get(2))
+    if ok:
+        print("VALID")
+        return 0
+    print("INVALID")
+    return 1
+
+
+# -- login ----------------------------------------------------------------------
+
+# Store a registry API token in ~/.taupkg/credentials for `taupkg publish`.
+def cmd_login(args: CliArgs) -> int:
+    mut token = args.first_pos()
+    if token.len() == 0:
+        token = args.flag_val("token", "")
+    if token.len() == 0:
+        print("Usage: taupkg login <token>")
+        print("Create a token in your registry account settings, then run `taupkg login <token>`.")
+        return 1
+    mkdir_p(taupkg_home())
+    File.write_text(credentials_path(), "token = \"" + token + "\"\n")
+    print("Saved credentials to " + credentials_path())
+    return 0

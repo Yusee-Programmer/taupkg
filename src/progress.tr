@@ -1,0 +1,247 @@
+# Beautiful, modern CLI progress output for taupkg.
+#
+# - download_with_progress: an animated byte-level download bar (percentage,
+#   size, speed, ETA) for large downloads like `install-tauraro` (bundled zig).
+#   curl runs in the background writing to the target file; we poll the partial
+#   file size and redraw a Unicode block bar in place.
+# - fmt_bytes / check / step_line / header: small helpers for a tidy install UI.
+
+from std.io import File
+from std.io.console import Console
+from std.sys.time import Clock
+from std.os import OS, Process, Env
+from util import shell_capture, rm_f
+
+extern "C":
+    def _tr_ansi_esc() -> str
+    def _tr_stdout_supports_ansi() -> int
+
+# ── color ─────────────────────────────────────────────────────────────────────
+
+# Emit ANSI when stdout is a real terminal. Overridable: TAUPKG_COLOR=always|never
+# (and NO_COLOR disables, per the informal standard).
+def _color() -> bool:
+    if Env.get_var("NO_COLOR").len() > 0: return false
+    mut f = Env.get_var("TAUPKG_COLOR")
+    if f == "always": return true
+    if f == "never": return false
+    return _tr_stdout_supports_ansi() == 1
+
+def _paint(s: str, code: str) -> str:
+    if not _color(): return s
+    mut e = _tr_ansi_esc()
+    return e + "[" + code + "m" + s + e + "[0m"
+
+# Foreground 256-color (8-bit) — richer, widely supported.
+def _fg(code: int, s: str) -> str:
+    if not _color(): return s
+    mut e = _tr_ansi_esc()
+    return e + "[38;5;" + str(code) + "m" + s + e + "[0m"
+
+pub def cyan(s: str) -> str:   return _fg(45, s)     # modern aqua
+pub def green(s: str) -> str:  return _fg(48, s)     # modern mint
+pub def dim(s: str) -> str:    return _paint(s, "2")
+pub def yellow(s: str) -> str: return _fg(214, s)    # warm amber
+
+# A smooth cyan→blue gradient color for filled bar cell `i` of `width`.
+def _grad(i: int, width: int) -> int:
+    mut seg = i * 5 / width
+    if seg <= 0: return 51    # bright cyan
+    if seg == 1: return 45    # aqua
+    if seg == 2: return 39    # sky
+    if seg == 3: return 33    # azure
+    return 27                 # blue
+
+# ── humanized sizes ───────────────────────────────────────────────────────────
+
+def _one_dp(n: int, div: int) -> str:
+    mut tenths = (n * 10) / div
+    return str(tenths / 10) + "." + str(tenths % 10)
+
+pub def fmt_bytes(n: int) -> str:
+    if n < 1024:            return str(n) + " B"
+    if n < 1048576:         return _one_dp(n, 1024) + " KB"
+    if n < 1073741824:      return _one_dp(n, 1048576) + " MB"
+    return _one_dp(n, 1073741824) + " GB"
+
+# ── the bar ───────────────────────────────────────────────────────────────────
+
+# A gradient block bar for `permille` (0..1000) across `width` cells. Each filled
+# cell is tinted along a cyan→blue gradient; the partial cell uses an eighth-block
+# A plain ASCII bar: '>' for the filled portion, spaces for the rest — no colors,
+# so it animates cleanly in any terminal.
+def _bar(permille: int, width: int) -> str:
+    mut full = permille * width / 1000
+    mut out = ""
+    mut i = 0
+    while i < full and i < width:
+        out = out + ">"
+        i = i + 1
+    while i < width:
+        out = out + " "
+        i = i + 1
+    return out
+
+# Hide / show the terminal cursor so it doesn't visibly jump during redraws.
+def _hide_cursor():
+    if _color(): Console.print(_tr_ansi_esc() + "[?25l")
+def _show_cursor():
+    if _color(): Console.print(_tr_ansi_esc() + "[?25h")
+
+def _spinner(ms: int) -> str:
+    mut idx = (ms / 100) % 10
+    if idx == 0: return "⠋"
+    if idx == 1: return "⠙"
+    if idx == 2: return "⠹"
+    if idx == 3: return "⠸"
+    if idx == 4: return "⠼"
+    if idx == 5: return "⠴"
+    if idx == 6: return "⠦"
+    if idx == 7: return "⠧"
+    if idx == 8: return "⠇"
+    return "⠏"
+
+def _pct(permille: int) -> str:
+    return str(permille / 10) + "." + str(permille % 10) + "%"
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+# Case-insensitive last index of `needle` (lowercase) in `hay`.
+def _last_index_ci(hay: str, needle: str) -> int:
+    mut best = 0 - 1
+    mut i = 0
+    while i + needle.len() <= hay.len():
+        mut ok = true
+        mut j = 0
+        while j < needle.len():
+            mut hc = hay.char_at(i + j)
+            if hc >= 65 and hc <= 90: hc = hc + 32
+            if hc != needle.char_at(j):
+                ok = false
+                j = needle.len()
+            else:
+                j = j + 1
+        if ok: best = i
+        i = i + 1
+    return best
+
+# Total download size via a HEAD request (follows redirects). 0 if unknown.
+def _content_length(url: str) -> int:
+    mut out = shell_capture("curl -sIL \"" + url + "\"")
+    mut key = "content-length:"
+    mut pos = _last_index_ci(out, key)
+    if pos < 0: return 0
+    mut rest = out.slice(pos + key.len(), out.len())
+    mut num = 0
+    mut i = 0
+    # skip spaces
+    while i < rest.len() and rest.char_at(i) == 32:
+        i = i + 1
+    mut seen = false
+    while i < rest.len():
+        mut c = rest.char_at(i)
+        if c < 48 or c > 57:
+            i = rest.len()
+        else:
+            num = num * 10 + (c - 48)
+            seen = true
+            i = i + 1
+    if not seen: return 0
+    return num
+
+# Humanize a duration in seconds: "42s" / "3m20s" / "1h04m".
+def _fmt_time(secs: int) -> str:
+    if secs < 60: return str(secs) + "s"
+    if secs < 3600: return str(secs / 60) + "m" + str(secs % 60) + "s"
+    return str(secs / 3600) + "h" + str((secs % 3600) / 60) + "m"
+
+# Redraw the download bar line in place (plain, no colors):
+#   label  [>>>>>>>          ]  42.5%  41 / 97 MB  6.2 MB/s  eta 9s
+def _render(label: str, cur: int, total: int, bps: int):
+    mut pm = 0
+    if total > 0:
+        pm = cur * 1000 / total
+        if pm > 1000: pm = 1000
+    mut line = "\r  " + label + "  [" + _bar(pm, 24) + "]  " + _pct(pm)
+    line = line + "  " + fmt_bytes(cur) + " / " + fmt_bytes(total)
+    if bps > 0:
+        line = line + "  " + fmt_bytes(bps) + "/s"
+        if total > cur:
+            line = line + "  eta " + _fmt_time((total - cur) / bps)
+    Console.print(line + "          ")
+
+# Single foreground download with curl's own bar (used when the size is unknown or
+# the server doesn't support HTTP range requests).
+def _single(url: str, dest: str, label: str) -> int:
+    rm_f(dest)
+    Console.println("  " + cyan("↓") + " " + label)
+    mut rc = Process.system("curl -# -fSL -o \"" + dest + "\" \"" + url + "\"")
+    if rc == 0:
+        mut sz = File.file_size(dest)
+        if sz < 0: sz = 0
+        Console.println("  " + green("✓") + " " + dim("downloaded " + fmt_bytes(sz)))
+    return rc
+
+# Download `url` → `dest` with a live, custom progress bar. Downloads in HTTP
+# byte-range chunks, each a plain FOREGROUND curl (no backgrounding, threads, or
+# file polling), rendering the bar between chunks — so it behaves identically on
+# Windows, macOS, and Linux, and on paths with spaces. Falls back to a single curl
+# when the total size is unknown or the server ignores Range. Returns 0 on success.
+pub def download_with_progress(url: str, dest: str, label: str) -> int:
+    mut total = _content_length(url)
+    if total <= 0:
+        return _single(url, dest, label)     # unknown size — can't show a % bar
+    rm_f(dest)
+    # Launch curl in the BACKGROUND (non-blocking) and poll the growing file every
+    # ~120ms, redrawing the bar — a continuously-live meter. `start "" /b` returns
+    # immediately on Windows; `&` on POSIX. curl is silenced so nothing leaks.
+    if OS.is_windows():
+        Process.system("start \"\" /b curl -s -fSL -o \"" + dest + "\" \"" + url + "\" 2>nul")
+    else:
+        Process.system("curl -s -fSL -o \"" + dest + "\" \"" + url + "\" >/dev/null 2>&1 &")
+
+    mut win_bytes = 0
+    mut win_ms = Clock.now_ms()
+    mut bps = 0
+    mut last = 0
+    mut stall = 0                              # consecutive polls with no growth
+    mut guard = 0
+    _hide_cursor()                             # so the cursor doesn't jump during redraws
+    _render(label, 0, total, 0)
+    while guard < 200000:
+        guard = guard + 1
+        mut cur = File.file_size(dest)
+        if cur < 0: cur = 0
+        if cur >= total:
+            _render(label, total, total, bps)
+            _show_cursor()
+            Console.println("")
+            Console.println("  " + green("✓") + " " + dim("downloaded " + fmt_bytes(total)))
+            return 0
+        mut now = Clock.now_ms()
+        if now - win_ms >= 500:                # instantaneous speed over ~0.5s window
+            bps = (cur - win_bytes) * 1000 / (now - win_ms)
+            if bps < 0: bps = 0
+            win_bytes = cur
+            win_ms = now
+        if cur == last: stall = stall + 1
+        else: stall = 0
+        last = cur
+        # ~30s with zero growth ⇒ the background curl died (network/HTTP error).
+        # Retry once in the FOREGROUND so the error is visible and we don't hang.
+        if stall > 250:
+            _show_cursor()
+            Console.println("")
+            return _single(url, dest, label)
+        _render(label, cur, total, bps)
+        Clock.sleep_ms(120)
+    _show_cursor()
+    return _single(url, dest, label)
+
+# ── small install-UI helpers ──────────────────────────────────────────────────
+
+pub def check(name: str, version: str):
+    Console.println("  " + green("✓") + " " + name + " " + dim(version))
+
+pub def header(title: str):
+    Console.println(cyan("❯") + " " + title)

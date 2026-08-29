@@ -85,9 +85,17 @@ pub def registry_search(query: str):
 # Publish a package to the registry.
 # Requires TAUPKG_TOKEN env variable.
 pub def registry_publish(manifest_path: str, tarball_path: str) -> bool:
+    # Token from the env (CI) or from ~/.taupkg/credentials (written by `taupkg login`).
     mut token = Env.get_var("TAUPKG_TOKEN")
     if token.len() == 0:
-        print("error: TAUPKG_TOKEN not set. Run `taupkg login` first.")
+        from std.io import File
+        from util import credentials_path
+        from toml import toml_load
+        if File.file_exists(credentials_path()):
+            mut cdoc = toml_load(credentials_path())
+            token = cdoc.get("_root", "token")
+    if token.len() == 0:
+        print("error: not logged in. Run `taupkg login <token>` (or set TAUPKG_TOKEN).")
         return false
     mut host = registry_host()
     # Use curl for multipart upload (HttpClient doesn't support multipart yet)

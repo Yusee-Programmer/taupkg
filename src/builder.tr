@@ -1,18 +1,22 @@
 # Build system integration for taupkg.
 #
-# Build sandbox layout (.taupkg/build/):
-#   src/          -- copy of the project's src/ directory
-#   <pkgname>/    -- installed package source (one dir per dep)
+# Resolution model (automatic — no compiler flags, no manual env):
+#   taupkg sets TAURARO_PATH to every installed package's importable directory
+#   (`.taupkg/packages/<name>/src`, or the package root for flat packages) and
+#   then compiles the project's real `src/main.tr` IN PLACE. The Tauraro compiler
+#   treats TAURARO_PATH like Python's PYTHONPATH, so `from <pkg> import X` — and a
+#   dependency's own transitive imports — resolve without copying anything.
 #
-# Compiler invocation:
-#   tau.exe .taupkg/build/src/main.tr -o <output>
-#
-# The package dirs are top-level alongside src/ so that
-# `from pkgname import X` resolves without any compiler flag changes.
+# Manual fallbacks (always available):
+#   • `taupkg env`        prints the TAURARO_PATH line to run `tauraroc` directly.
+#   • `taupkg build --sandbox` copies everything into `.taupkg/build/` and compiles
+#     there (hermetic; useful if in-place resolution ever misbehaves).
+#   • Any pre-existing TAURARO_PATH in the environment is preserved (appended), so
+#     a user can point at extra trees and taupkg won't clobber it.
 
 from std.io import File
 from std.os import OS, Process, Env
-from util import path_join, mkdir_p, rm_rf, cp_r, project_build_dir, project_pkg_dir, shell_capture
+from util import path_join, mkdir_p, rm_rf, cp_r, project_build_dir, project_pkg_dir, shell_capture, shell_quote, shell_run
 from manifest import Manifest
 from lockfile import Lockfile, LockedPkg
 
@@ -28,14 +32,63 @@ pub def find_compiler() -> str:
     return "tauraroc"
 
 
-# Prepare the build sandbox.
-# Copies project src/ and all installed packages into .taupkg/build/.
+# The importable directory for each installed package: `<pkg>/src` when present
+# (the usual layout), otherwise the package root (flat single-file packages).
+# Absolute paths, so resolution is independent of the compiler's working dir.
+pub def package_search_paths(project_root: str, lockfile: Lockfile) -> Vec[str]:
+    mut out = Vec[str].init(lockfile.packages.len + 1)
+    mut pkg_base = project_pkg_dir(project_root)
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        mut pdir = path_join(pkg_base, p.name)
+        mut psrc = path_join(pdir, "src")
+        if File.dir_exists(psrc):
+            out.push(psrc)
+        elif File.dir_exists(pdir):
+            out.push(pdir)
+        i = i + 1
+    return out
+
+
+# The TAURARO_PATH value taupkg exports: our package dirs first, then any
+# pre-existing TAURARO_PATH (so manual entries remain a working fallback).
+pub def tauraro_path_value(project_root: str, lockfile: Lockfile) -> str:
+    mut sep = ":"
+    if OS.is_windows(): sep = ";"
+    mut parts = package_search_paths(project_root, lockfile)
+    mut val = ""
+    mut i = 0
+    while i < parts.len:
+        if val.len() > 0: val = val + sep
+        val = val + parts.get(i)
+        i = i + 1
+    mut existing = Env.get_var("TAURARO_PATH")
+    if existing.len() > 0:
+        if val.len() > 0: val = val + sep
+        val = val + existing
+    return val
+
+
+# Set TAURARO_PATH in this process's environment; child compiler processes
+# launched via Process.system inherit it. Returns the value set (for logging).
+pub def apply_tauraro_path(project_root: str, lockfile: Lockfile, verbose: bool) -> str:
+    mut val = tauraro_path_value(project_root, lockfile)
+    if val.len() > 0:
+        Env.set_var("TAURARO_PATH", val)
+        if verbose:
+            print("  TAURARO_PATH=" + val)
+    return val
+
+
+# Prepare the hermetic build sandbox (used only for `--sandbox`).
+# Copies project src/ and all installed packages into .taupkg/build/ as
+# top-level dirs so `from pkgname import X` resolves purely by layout.
 pub def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfile, verbose: bool) -> bool:
     mut build_dir = project_build_dir(project_root)
     rm_rf(build_dir)
     mkdir_p(build_dir)
 
-    # Copy project source
     mut src_src = path_join(project_root, "src")
     mut src_dst = path_join(build_dir, "src")
     if not File.dir_exists(src_src):
@@ -43,12 +96,10 @@ pub def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfil
         return false
     if verbose:
         print("  copying src/ -> " + src_dst)
-    mut ok = cp_r(src_src, src_dst)
-    if not ok:
+    if not cp_r(src_src, src_dst):
         print("error: failed to copy src/ directory")
         return false
 
-    # Copy each installed package as a top-level directory
     mut pkg_base = project_pkg_dir(project_root)
     mut i = 0
     while i < lockfile.packages.len:
@@ -63,49 +114,84 @@ pub def prepare_sandbox(project_root: str, manifest: Manifest, lockfile: Lockfil
             print("  linking " + p.name + "@" + p.version)
         cp_r(pkg_src, pkg_dst)
         i = i + 1
-
     return true
 
 
-# Run the Tauraro compiler on the build sandbox.
-# Returns the compiler exit code (0 = success).
-pub def run_compiler(project_root: str, manifest: Manifest, output: str, release: bool, verbose: bool) -> int:
-    mut build_dir = project_build_dir(project_root)
-    mut cc = find_compiler()
-
+# Resolve the entry file and output path for a build.
+def _entry_and_output(project_root: str, manifest: Manifest, base_dir: str, output: str, target: str) -> Vec[str]:
     mut entry = manifest.bin
     if entry.len() == 0:
         entry = "src/main.tr"
-    # Entry path relative to build_dir
-    mut entry_path = path_join(build_dir, entry)
-
+    mut entry_path = path_join(base_dir, entry)
     mut out_path = output
     if out_path.len() == 0:
         out_path = path_join(project_root, manifest.name)
-        if OS.is_windows():
+        if OS.is_windows() and target.len() == 0:
             out_path = out_path + ".exe"
+    mut pair = Vec[str].init(2)
+    pair.push(entry_path)
+    pair.push(out_path)
+    return pair
 
-    mut cmd = cc + " \"" + entry_path + "\" -o \"" + out_path + "\""
+
+# Run the Tauraro compiler. `use_sandbox` selects the hermetic `.taupkg/build/`
+# tree as the compile root; otherwise the project's real `src/` is compiled in
+# place. TAURARO_PATH is set automatically in both modes so deps resolve.
+# Returns the compiler exit code (0 = success).
+pub def run_compiler(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, target: str, use_sandbox: bool, verbose: bool) -> int:
+    mut cc = find_compiler()
+    mut base_dir = project_root
+    if use_sandbox:
+        base_dir = project_build_dir(project_root)
+
+    mut io = _entry_and_output(project_root, manifest, base_dir, output, target)
+    mut entry_path = io.get(0)
+    mut out_path   = io.get(1)
+
+    apply_tauraro_path(project_root, lockfile, verbose)
+
+    # Quote each token only when needed and wrap the whole line on Windows, so a
+    # TAURARO_COMPILER path containing spaces (e.g. under "Program Files") works.
+    mut cmd = shell_quote(cc) + " " + shell_quote(entry_path) + " -o " + shell_quote(out_path)
     if release:
         cmd = cmd + " -O3"
+    if target.len() > 0:
+        # tauraroc bundles zig cc, so cross-compiling needs no extra toolchain install.
+        cmd = cmd + " --target " + target
     if verbose:
         print("  " + cmd)
+    return shell_run(cmd)
 
-    return Process.system(cmd)
+
+# Print actionable guidance after a failed build. The compiler has already
+# printed the underlying error; this points at the taupkg-level fixes.
+def _build_failure_guidance(project_root: str, lockfile: Lockfile):
+    print("")
+    print("Build failed. Things to check:")
+    if lockfile.packages.len == 0:
+        print("  - No dependencies are installed. If your code imports a package,")
+        print("    add it under [deps] in taupkg.toml and run `taupkg install`.")
+    else:
+        print("  - Missing/incomplete deps?  run `taupkg install` to (re)fetch the graph.")
+        print("  - Import can't be found?     taupkg sets TAURARO_PATH automatically; to")
+        print("    compile with `tauraroc` directly, run `taupkg env` and export it.")
+        print("  - Suspect the in-place layout?  retry hermetically: `taupkg build --sandbox`.")
+    print("  - Wrong compiler?  set TAURARO_COMPILER to the tauraroc binary you want.")
 
 
-# High-level build: prepare sandbox + compile.
-pub def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, verbose: bool) -> bool:
-    if verbose:
-        print("Preparing build sandbox...")
-    mut ok = prepare_sandbox(project_root, manifest, lockfile, verbose)
-    if not ok:
-        return false
+# High-level build: (optionally) prepare sandbox, set TAURARO_PATH, compile.
+pub def build_project(project_root: str, manifest: Manifest, lockfile: Lockfile, output: str, release: bool, target: str, use_sandbox: bool, verbose: bool) -> bool:
+    if use_sandbox:
+        if verbose:
+            print("Preparing hermetic build sandbox...")
+        if not prepare_sandbox(project_root, manifest, lockfile, verbose):
+            return false
     if verbose:
         print("Compiling " + manifest.name + "...")
-    mut rc = run_compiler(project_root, manifest, output, release, verbose)
+    mut rc = run_compiler(project_root, manifest, lockfile, output, release, target, use_sandbox, verbose)
     if rc != 0:
         print("error: compilation failed (exit code " + str(rc) + ")")
+        _build_failure_guidance(project_root, lockfile)
         return false
     return true
 

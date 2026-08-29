@@ -106,7 +106,7 @@ pub def parse_args(argv: Vec[str]) -> CliArgs:
 
 pub def print_usage():
     print("""
-taupkg -- Tauraro package manager v0.0.1
+taupkg -- Tauraro package manager v0.0.2
 
 Usage:
   taupkg <command> [options]
@@ -115,13 +115,34 @@ Commands:
   init [name]              Create taupkg.toml in the current directory
   add <pkg>[@constraint]   Add a dependency (and install it)
   remove <pkg>             Remove a dependency
-  install                  Install all deps listed in taupkg.toml
-  update [pkg]             Update all (or one) dep to newest compatible
-  build [--release] [-o f] Build the project
+  install [--locked]       Resolve + install the full dependency graph
+    [--offline]              Use only already-downloaded packages (no network)
+  update [pkg]             Re-resolve all (or one) dep to newest compatible
+  tree                     Print the resolved dependency graph
+  audit                    Verify integrity against the lock + check advisories
+  sbom [-o <file>]         Emit a CycloneDX SBOM of the dependency graph
+  build [--release]        Build the project (auto-sets TAURARO_PATH, compiles in place)
+    [--target <triple>]      Cross-compile (zero-config; tauraroc bundles zig cc)
+    [--sandbox]              Hermetic build: copy into .taupkg/build/ (fallback)
+    [--features a,b]         Enable feature(s) (pulls in their optional deps)
+    [--all-features]         Enable every feature
+    [--no-default-features]  Do not enable [features].default
+    [-o <file>]              Output binary path
   run [--release] [-- ...]  Build and run
-  test                     Build and run tests
+  env                      Print the TAURARO_PATH line to run `tauraroc` directly
+  bindgen <header>         Generate FFI bindings as an importable taupkg package
+    [-h cpp] [--macros]      C++ mode / bind function-like macros
+    [--pkg <name>]           Auto-discover -I/-D/-l via pkg-config
+    [-I<dir>] [-D<macro>]    Extra clang flags (forwarded to tauraroc bindgen)
+    [--name <pkg>]           Package name (default: from header filename)
+    [--out <dir>]            Where to create the package (default: cwd)
+  test                     Build and run tests (includes [dev-deps])
   search <query>           Search the registry
-  publish                  Publish this package to the registry
+  login <token>            Store a registry token for publishing
+  key <gen|show|trust>     Manage ed25519 signing keys ([--name <id>])
+  sign <msg> [--name <k>]  Sign a message with your key (ed25519)
+  verify <msg> <sig> <pk>  Verify an ed25519 signature
+  publish [--dry-run]      Publish to the registry (signs if a key exists)
   info <pkg>               Show package information
   list                     List installed packages
   clean                    Remove .taupkg/build/
@@ -133,5 +154,8 @@ Commands:
 Options:
   --verbose, -v            Show detailed output
   --release                Compile with -O3 optimizations
+  --locked / --offline     Reproducible install: replay the lock / no network
+  --sandbox                Build hermetically in .taupkg/build/ (path-resolution fallback)
+  --target <triple>        Cross-compilation target
   -o <file>                Output binary path (build/run)
 """)

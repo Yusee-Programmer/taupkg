@@ -1,0 +1,143 @@
+# Security tooling for taupkg: SBOM generation and vulnerability auditing.
+#
+# - generate_sbom: emit a CycloneDX 1.5 JSON software bill of materials of the
+#   resolved dependency graph (name, version, source, purl, SHA-256 hash).
+# - advisories: check installed packages against an advisory database
+#   (`.taupkg/advisories.toml` in the project or ~/.taupkg/advisories.toml),
+#   reporting any package whose version falls in an affected range.
+#
+# taupkg records a full-tree content checksum per package in the lock, so the SBOM
+# hashes are tamper-evident and `taupkg audit` re-verifies them.
+
+from std.io import File
+from manifest import Manifest
+from lockfile import Lockfile, LockedPkg
+from semver import Version
+from toml import toml_load, TomlSection
+from util import path_join, taupkg_home
+
+# ── SBOM (CycloneDX 1.5) ──────────────────────────────────────────────────────
+
+# Minimal JSON string escape (quote + backslash + control) — enough for package
+# names, versions, and source/path strings (Windows paths carry backslashes).
+def _json_esc(s: str) -> str:
+    mut out = ""
+    mut i = 0
+    while i < s.len():
+        mut c = s.slice(i, i + 1)
+        if c == "\\": out = out + "\\\\"
+        elif c == "\"": out = out + "\\\""
+        elif c == "\n": out = out + "\\n"
+        elif c == "\t": out = out + "\\t"
+        else: out = out + c
+        i = i + 1
+    return out
+
+# Strip a "sha256:" prefix to get the bare hex digest for a CycloneDX hash entry.
+def _bare_hash(checksum: str) -> str:
+    if checksum.starts_with("sha256:"):
+        return checksum.slice(7, checksum.len())
+    return checksum
+
+# Build a CycloneDX 1.5 SBOM document for the resolved graph.
+pub def generate_sbom(root: Manifest, lockfile: Lockfile) -> str:
+    mut b = "{\n"
+    b = b + "  \"bomFormat\": \"CycloneDX\",\n"
+    b = b + "  \"specVersion\": \"1.5\",\n"
+    b = b + "  \"version\": 1,\n"
+    b = b + "  \"metadata\": {\n"
+    b = b + "    \"component\": {\n"
+    b = b + "      \"type\": \"application\",\n"
+    b = b + "      \"name\": \"" + _json_esc(root.name) + "\",\n"
+    b = b + "      \"version\": \"" + _json_esc(root.version) + "\",\n"
+    b = b + "      \"purl\": \"pkg:tauraro/" + _json_esc(root.name) + "@" + _json_esc(root.version) + "\"\n"
+    b = b + "    }\n"
+    b = b + "  },\n"
+    b = b + "  \"components\": [\n"
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        b = b + "    {\n"
+        b = b + "      \"type\": \"library\",\n"
+        b = b + "      \"name\": \"" + _json_esc(p.name) + "\",\n"
+        b = b + "      \"version\": \"" + _json_esc(p.version) + "\",\n"
+        b = b + "      \"purl\": \"pkg:tauraro/" + _json_esc(p.name) + "@" + _json_esc(p.version) + "\",\n"
+        mut hh = _bare_hash(p.checksum)
+        if hh.len() > 0 and hh != "none":
+            b = b + "      \"hashes\": [ { \"alg\": \"SHA-256\", \"content\": \"" + _json_esc(hh) + "\" } ],\n"
+        b = b + "      \"properties\": [ { \"name\": \"taupkg:source\", \"value\": \"" + _json_esc(p.source) + "\" } ]\n"
+        if i + 1 < lockfile.packages.len:
+            b = b + "    },\n"
+        else:
+            b = b + "    }\n"
+        i = i + 1
+    b = b + "  ]\n"
+    b = b + "}\n"
+    return b
+
+
+# ── Advisories ────────────────────────────────────────────────────────────────
+
+pub class Advisory:
+    pub id:          str
+    pub package:     str
+    pub versions:    str    # affected-version constraint (a version IS affected if it satisfies this)
+    pub severity:    str
+    pub description: str
+
+extend Advisory:
+    pub def init(id: str, package: str, versions: str, severity: str, description: str) -> Advisory:
+        mut a = Advisory()
+        a.id          = id
+        a.package     = package
+        a.versions    = versions
+        a.severity    = severity
+        a.description = description
+        return a
+
+# Read advisories from a single TOML file's `[[advisory]]` array-of-tables.
+def _load_from(path: str, out: Vec[Advisory]):
+    if not File.file_exists(path): return
+    mut doc = toml_load(path)
+    for sec in doc.get_array("advisory"):
+        mut id  = ""
+        mut pkg = ""
+        mut ver = "*"
+        mut sev = "unknown"
+        mut desc = ""
+        if sec.keys.contains("id"):          id  = sec.keys.get("id")
+        if sec.keys.contains("package"):     pkg = sec.keys.get("package")
+        if sec.keys.contains("versions"):    ver = sec.keys.get("versions")
+        if sec.keys.contains("severity"):    sev = sec.keys.get("severity")
+        if sec.keys.contains("description"): desc = sec.keys.get("description")
+        if pkg.len() > 0:
+            out.push(Advisory.init(id, pkg, ver, sev, desc))
+
+# Load the advisory database: project-local first, then the user-global one.
+pub def load_advisories(project_root: str) -> Vec[Advisory]:
+    mut out = Vec[Advisory].init(8)
+    _load_from(path_join(project_root, ".taupkg/advisories.toml"), out)
+    _load_from(path_join(taupkg_home(), "advisories.toml"), out)
+    return out
+
+# Check every locked package against the advisories; print matches. Returns the
+# number of vulnerabilities found.
+pub def audit_advisories(lockfile: Lockfile, advisories: Vec[Advisory]) -> int:
+    if advisories.len == 0:
+        return 0
+    mut hits = 0
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        i = i + 1
+        mut v = Version.init(p.version)
+        mut j = 0
+        while j < advisories.len:
+            mut a = advisories.get(j)
+            j = j + 1
+            if a.package == p.name and v.satisfies(a.versions):
+                hits = hits + 1
+                print("  ! [" + a.severity + "] " + p.name + "@" + p.version + " — " + a.id)
+                print("      " + a.description)
+                print("      affected: " + a.versions)
+    return hits

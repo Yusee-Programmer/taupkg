@@ -1,0 +1,490 @@
+# `taupkg bindgen` — generate Tauraro FFI bindings as a ready-to-import package.
+#
+# Wraps `tauraroc bindgen` (all flags forwarded verbatim) and wraps the output in
+# a normal taupkg package so `from <name> import ...` works via the auto-set
+# TAURARO_PATH. On top of the raw bindings it adds intelligence:
+#   • scaffolds taupkg.toml + src/<name>.tr (+ shim) + guide.txt + README.md
+#   • scans the header's #include graph (system vs local deps)
+#   • reads the generated `# tauraro-cpp-*` link pragmas → exact link guidance
+#   • a small header→link-flag knowledge base fills gaps when no pragma exists
+#   • self-validates the bindings with `tauraroc --check`
+#   • records the exact invocation for reproducible regeneration
+#
+# Usage:
+#   taupkg bindgen <header> [tauraroc-bindgen flags...] [--name <pkg>] [--out <dir>]
+# Examples:
+#   taupkg bindgen zlib.h --pkg zlib
+#   taupkg bindgen /usr/include/cairo/cairo.h -Icairo --name cairo
+#   taupkg bindgen mylib.hpp -h cpp --macros --name mylib
+
+from std.io import File
+from std.os import OS, Process
+from util import path_join, mkdir_p, rm_f, path_base
+from builder import find_compiler
+
+pub def cmd_bindgen(argv: Vec[str], project_root: str, verbose: bool) -> int:
+    # ── Parse: split taupkg-level flags from the tauraroc-bindgen passthrough ──
+    mut pkg_name = ""
+    mut out_dir  = project_root
+    mut header   = ""
+    mut is_cpp   = false
+    mut has_macros = false
+    mut pkg_hint = ""            # value of --pkg, if given (for guidance)
+    mut passthrough = Vec[str].init(16)
+
+    mut i = 2                    # argv[0]=prog, argv[1]="bindgen"
+    while i < argv.len:
+        mut a = argv.get(i)
+        if a == "--name" and i + 1 < argv.len:
+            pkg_name = argv.get(i + 1); i = i + 2; continue
+        if (a == "--out" or a == "--dir") and i + 1 < argv.len:
+            out_dir = argv.get(i + 1); i = i + 2; continue
+        if a == "-o" and i + 1 < argv.len:
+            # taupkg controls the output layout — ignore a user -o.
+            print("note: -o is managed by taupkg bindgen; ignoring '" + argv.get(i + 1) + "'")
+            i = i + 2; continue
+        if a == "-h" and i + 1 < argv.len and argv.get(i + 1) == "cpp":
+            is_cpp = true
+            passthrough.push("-h"); passthrough.push("cpp"); i = i + 2; continue
+        if a == "--cpp":
+            is_cpp = true; passthrough.push(a); i = i + 1; continue
+        if a == "--macros":
+            has_macros = true; passthrough.push(a); i = i + 1; continue
+        if a == "--pkg" and i + 1 < argv.len:
+            pkg_hint = argv.get(i + 1)
+            passthrough.push("--pkg"); passthrough.push(pkg_hint); i = i + 2; continue
+        if not a.starts_with("-") and header == "":
+            header = a
+            passthrough.push(a); i = i + 1; continue
+        passthrough.push(a); i = i + 1
+
+    if header == "":
+        print("error: taupkg bindgen requires a header.")
+        print("usage: taupkg bindgen <header> [flags...] [--name <pkg>] [--out <dir>]")
+        return 1
+
+    if pkg_name == "":
+        pkg_name = _derive_name(header)
+    if pkg_name == "":
+        print("error: could not derive a package name from '" + header + "'; pass --name <pkg>.")
+        return 1
+
+    # ── Scaffold the package directories ──────────────────────────────────────
+    mut pkg_dir = path_join(out_dir, pkg_name)
+    mut pkg_src = path_join(pkg_dir, "src")
+    mkdir_p(pkg_src)
+    mut out_tr = path_join(pkg_src, pkg_name + ".tr")
+
+    # ── Build + run the tauraroc bindgen command ──────────────────────────────
+    mut cc = find_compiler()
+    mut cmd = _q(cc) + " bindgen"
+    mut pi = 0
+    while pi < passthrough.len:
+        cmd = cmd + " " + _q(passthrough.get(pi))
+        pi = pi + 1
+    cmd = cmd + " -o " + _q(out_tr)
+    if verbose:
+        print("  " + cmd)
+    else:
+        print("Generating bindings for " + header + " → " + pkg_name + " ...")
+
+    # Portable regeneration command (no resolved compiler path / -o): what the
+    # user would type to reproduce these bindings.
+    mut regen = "taupkg bindgen"
+    mut ri = 0
+    while ri < passthrough.len:
+        regen = regen + " " + _q(passthrough.get(ri))
+        ri = ri + 1
+    regen = regen + " --name " + pkg_name
+
+    mut rc = _run(cmd)
+    _cleanup_scratch(pkg_name)
+    if rc != 0 or not File.file_exists(out_tr):
+        print("")
+        if rc == 0:
+            print("error: the compiler ran but produced no bindings.")
+            print("  Your tauraroc may be too old to support `bindgen`. Update it")
+            print("  (`taupkg install-tauraro`) or point TAURARO_COMPILER at a newer build.")
+        else:
+            print("error: bindgen failed (exit " + str(rc) + ").")
+            _failure_guidance(is_cpp, pkg_hint)
+        return 1
+
+    # ── Analyze: pragmas, symbols, includes ───────────────────────────────────
+    mut gen = File.read_text(out_tr)
+    mut prag = _extract_pragmas(gen)          # shim / lib / linkflags / cflags (or "")
+    mut symbols = _extract_symbols(gen)       # Vec[str] of decl signatures
+    mut hdr_text = ""
+    if File.file_exists(header):
+        hdr_text = File.read_text(header)
+    mut sys_inc = Vec[str].init(8)
+    mut loc_inc = Vec[str].init(8)
+    _scan_includes(hdr_text, sys_inc, loc_inc)
+
+    # ── Emit package files ────────────────────────────────────────────────────
+    _write_manifest(pkg_dir, pkg_name, header, is_cpp, regen, prag, sys_inc)
+    _write_guide(pkg_dir, pkg_name, header, is_cpp, has_macros, prag, symbols, sys_inc, loc_inc, regen)
+    _write_readme(pkg_dir, pkg_name, header)
+
+    # ── Self-validate (parse + sema, no codegen) ──────────────────────────────
+    mut quiet = " >" + _devnull() + " 2>&1"
+    mut vrc = _run(_q(cc) + " " + _q(out_tr) + " --check" + quiet)
+    mut validated = vrc == 0
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    print("")
+    print("✓ Generated package '" + pkg_name + "' at " + pkg_dir)
+    print("  bindings : src/" + pkg_name + ".tr  (" + str(symbols.len) + " symbols)")
+    if prag.get(0) != "":
+        print("  shim     : src/" + prag.get(0) + "  (auto-compiled + linked)")
+    if prag.get(2) != "":
+        print("  links    :" + prag.get(2))
+    if validated:
+        print("  check    : OK (bindings parse + type-check)")
+    else:
+        print("  check    : bindings did not pass --check — see guide.txt (may need extra -I/-D)")
+    print("")
+    print("Next steps (see " + path_join(pkg_dir, "guide.txt") + "):")
+    print("  1. Add to your app's taupkg.toml:   [deps]")
+    print("       " + pkg_name + " = { path = \"" + _rel_hint(out_dir, pkg_name) + "\" }")
+    print("  2. Import:                          from " + pkg_name + " import <symbol>")
+    print("  3. Build (auto-resolves + links):   taupkg build")
+    return 0
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+# Quote a command token ONLY when it needs it (contains a space, or is empty).
+# Quoting the first token unconditionally trips cmd.exe's `cmd /c "a" "b"`
+# quote-stripping rule ("The filename, directory name, or volume label syntax is
+# incorrect"), so a space-free `tauraroc.exe` must stay bare.
+def _q(s: str) -> str:
+    if s.len() == 0: return "\"\""
+    if s.index_of(" ") >= 0: return "\"" + s + "\""
+    return s
+
+def _devnull() -> str:
+    if OS.is_windows(): return "nul"
+    return "/dev/null"
+
+# Run a shell command. On Windows the whole line is wrapped in an outer quote
+# pair so `cmd /c` strips exactly those and preserves any interior quoting — the
+# canonical fix for command lines that contain quoted paths.
+def _run(cmd: str) -> int:
+    if OS.is_windows():
+        return Process.system("\"" + cmd + "\"")
+    return Process.system(cmd)
+
+# Derive a package name from a header path: basename minus a .h/.hpp/.hh/.hxx ext,
+# lowercased-ish (kept as-is except extension), non-ident chars → '_'.
+def _derive_name(header: str) -> str:
+    mut b = path_base(header)
+    mut dot = b.len()
+    mut k = 0
+    while k < b.len():
+        if b.char_at(k) == 46: dot = k   # last '.'
+        k = k + 1
+    if dot < b.len(): b = b.slice(0, dot)
+    mut out = ""
+    mut j = 0
+    while j < b.len():
+        mut c = b.char_at(j)
+        mut ok = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 95
+        if ok:
+            out = out + b.slice(j, j + 1)
+        else:
+            out = out + "_"
+        j = j + 1
+    return out
+
+# Read the leading pragma block of a generated binding. Returns a 4-element Vec:
+#   [0] shim file basename (or "")   [1] cpp lib (e.g. "stdc++", or "")
+#   [2] linkflags (e.g. " -lz")      [3] cflags (or "")
+def _extract_pragmas(gen: str) -> Vec[str]:
+    mut out = Vec[str].init(4)
+    out.push(""); out.push(""); out.push(""); out.push("")
+    for line in gen.split("\n"):
+        mut t = line.trim()
+        if t.len() == 0:
+            continue
+        if not t.starts_with("#"):
+            break                       # first real declaration ends the pragma header
+        if t.starts_with("# tauraro-cpp-shim:"):
+            out.set(0, t.slice(19, t.len()).trim())
+        elif t.starts_with("# tauraro-cpp-lib:"):
+            out.set(1, t.slice(18, t.len()).trim())
+        elif t.starts_with("# tauraro-cpp-linkflags:"):
+            out.set(2, t.slice(24, t.len()))
+        elif t.starts_with("# tauraro-cpp-cflags:"):
+            out.set(3, t.slice(21, t.len()).trim())
+    return out
+
+# Collect a sample of top-level declaration signatures from the bindings.
+def _extract_symbols(gen: str) -> Vec[str]:
+    mut out = Vec[str].init(64)
+    for line in gen.split("\n"):
+        mut t = line.trim()
+        if t.starts_with("pub def ") or t.starts_with("def ") or t.starts_with("pub class ") or t.starts_with("class ") or t.starts_with("type ") or t.starts_with("pub type "):
+            # trim a trailing ':' body-opener for readability
+            mut s = t
+            if s.ends_with(":"): s = s.slice(0, s.len() - 1)
+            out.push(s)
+    return out
+
+# Scan a header's text for #include directives, splitting system <...> from
+# local "..." includes.
+def _scan_includes(text: str, sys_out: Vec[str], loc_out: Vec[str]):
+    for line in text.split("\n"):
+        mut t = line.trim()
+        if not t.starts_with("#"): continue
+        mut rest = t.slice(1, t.len()).trim()
+        if not rest.starts_with("include"): continue
+        rest = rest.slice(7, rest.len()).trim()
+        if rest.starts_with("<"):
+            mut e = rest.index_of(">")
+            if e > 1:
+                mut name = rest.slice(1, e)
+                if not _vec_has(sys_out, name): sys_out.push(name)
+        elif rest.starts_with("\""):
+            mut e = rest.slice(1, rest.len()).index_of("\"")
+            if e >= 0:
+                mut name = rest.slice(1, 1 + e)
+                if not _vec_has(loc_out, name): loc_out.push(name)
+
+def _vec_has(v: Vec[str], s: str) -> bool:
+    mut i = 0
+    while i < v.len:
+        if v.get(i) == s: return true
+        i = i + 1
+    return false
+
+# Best-effort mapping from a well-known system header to its link flag(s).
+# Used only to *suggest* flags in the guide when the bindings carry no pragma.
+def _guess_link(include_name: str) -> str:
+    mut h = include_name
+    if h == "zlib.h": return "-lz"
+    if h == "sqlite3.h": return "-lsqlite3"
+    if h == "curl/curl.h": return "-lcurl"
+    if h == "png.h" or h.ends_with("/png.h"): return "-lpng"
+    if h == "jpeglib.h": return "-ljpeg"
+    if h == "cairo.h" or h.ends_with("/cairo.h"): return "-lcairo"
+    if h == "GL/gl.h": return "-lGL"
+    if h == "GL/glu.h": return "-lGLU"
+    if h.starts_with("SDL2/"): return "-lSDL2"
+    if h.starts_with("openssl/"): return "-lssl -lcrypto"
+    if h == "ncurses.h" or h == "curses.h": return "-lncurses"
+    if h == "pcre.h": return "-lpcre"
+    if h == "pthread.h": return "-lpthread"
+    if h == "math.h": return "-lm"
+    return ""
+
+# Relative path hint for a path dependency (out_dir may be the project root).
+def _rel_hint(out_dir: str, pkg_name: str) -> str:
+    return "./" + pkg_name
+
+# Remove the intermediate scratch files bindgen leaves in the CWD.
+def _cleanup_scratch(pkg_name: str):
+    mut names = Vec[str].init(24)
+    names.push("_bindgen_empty.h")
+    names.push("_bindgen_base.i")
+    names.push("_bindgen_decls.i")
+    names.push("_bindgen_defs.i")
+    names.push("_macroprobe.c")
+    names.push("_macroprobe.exe")
+    names.push("_macroprobe")
+    names.push("_cxxprobe.c")
+    names.push("_cxxprobe.exe")
+    names.push("_cxxprobe")
+    names.push("_cxxwalk.c")
+    names.push("_cxxwalk.exe")
+    names.push("_cxxwalk")
+    names.push("_cxx_empty.cpp")
+    names.push("_cxx_force.cpp")
+    names.push("mywalk.exe")
+    names.push("mywalk")
+    mut i = 0
+    while i < names.len:
+        rm_f(names.get(i))
+        i = i + 1
+
+def _failure_guidance(is_cpp: bool, pkg_hint: str):
+    print("Things to check:")
+    print("  - Header not found?  pass its directory with -I<dir> (or an absolute path).")
+    if is_cpp:
+        print("  - C++ mode needs libclang + a C++ compiler; try `--cc clang++`.")
+    if pkg_hint == "":
+        print("  - System library?  try `--pkg <pkgconfig-name>` to auto-discover -I/-D/-l.")
+    print("  - Missing symbols?   add the right -D<macro> the library expects.")
+    print("  - Run with --verbose to see the exact tauraroc command.")
+
+def _write_manifest(pkg_dir: str, name: str, header: str, is_cpp: bool, cmd: str, prag: Vec[str], sys_inc: Vec[str]):
+    mut mode = "c"
+    if is_cpp: mode = "cpp"
+    mut inc = ""
+    mut i = 0
+    while i < sys_inc.len:
+        if inc.len() > 0: inc = inc + ", "
+        inc = inc + sys_inc.get(i)
+        i = i + 1
+    mut out = "[package]\n"
+    out = out + "name    = \"" + name + "\"\n"
+    out = out + "version = \"0.1.0\"\n"
+    out = out + "desc    = \"Auto-generated Tauraro FFI bindings for " + header + "\"\n"
+    out = out + "license = \"MIT\"\n\n"
+    out = out + "[deps]\n\n"
+    # Machine-readable provenance so the bindings can be regenerated reproducibly.
+    out = out + "[bindgen]\n"
+    out = out + "header    = \"" + header + "\"\n"
+    out = out + "mode      = \"" + mode + "\"\n"
+    if prag.get(2) != "":
+        out = out + "linkflags = \"" + prag.get(2).trim() + "\"\n"
+    if inc != "":
+        out = out + "includes  = \"" + inc + "\"\n"
+    out = out + "command   = \"" + _escape_q(cmd) + "\"\n"
+    File.write_text(path_join(pkg_dir, "taupkg.toml"), out)
+
+# Escape a string for a TOML basic (double-quoted) value: backslash and quote.
+def _escape_q(s: str) -> str:
+    mut out = ""
+    mut i = 0
+    while i < s.len():
+        mut c = s.slice(i, i + 1)
+        if c == "\\": out = out + "\\\\"
+        elif c == "\"": out = out + "\\\""
+        else: out = out + c
+        i = i + 1
+    return out
+
+def _write_readme(pkg_dir: str, name: str, header: str):
+    mut out = "# " + name + "\n\n"
+    out = out + "Tauraro FFI bindings for `" + header + "`, generated by `taupkg bindgen`.\n\n"
+    out = out + "See [guide.txt](guide.txt) for import and build instructions.\n"
+    File.write_text(path_join(pkg_dir, "README.md"), out)
+
+def _write_guide(pkg_dir: str, name: str, header: str, is_cpp: bool, has_macros: bool, prag: Vec[str], symbols: Vec[str], sys_inc: Vec[str], loc_inc: Vec[str], cmd: str):
+    mut mode = "C"
+    if is_cpp: mode = "C++ (auto C++→C shim)"
+    mut g = ""
+    g = g + "==============================================================\n"
+    g = g + " " + name + " — Tauraro FFI bindings\n"
+    g = g + "==============================================================\n\n"
+    g = g + "Source header : " + header + "\n"
+    g = g + "Binding mode  : " + mode + "\n"
+    if has_macros: g = g + "Macros        : function-like C macros bound (--macros)\n"
+    g = g + "\n"
+
+    g = g + "--------------------------------------------------------------\n"
+    g = g + " 1. IMPORT (this is a normal taupkg package)\n"
+    g = g + "--------------------------------------------------------------\n"
+    g = g + "Add it to your project's taupkg.toml under [deps]:\n\n"
+    g = g + "    [deps]\n"
+    g = g + "    " + name + " = { path = \"path/to/" + name + "\" }\n\n"
+    g = g + "Then import in your Tauraro code:\n\n"
+    g = g + "    from " + name + " import <symbol>\n\n"
+    mut ex = _first_symbol_id(symbols)
+    if ex != "":
+        g = g + "For example:\n\n"
+        g = g + "    from " + name + " import " + ex + "\n\n"
+
+    g = g + "--------------------------------------------------------------\n"
+    g = g + " 2. BUILD & LINK\n"
+    g = g + "--------------------------------------------------------------\n"
+    g = g + "With taupkg (recommended — resolves paths and sets TAURARO_PATH):\n\n"
+    g = g + "    taupkg build\n\n"
+    if prag.get(0) != "" or prag.get(1) != "" or prag.get(2) != "":
+        g = g + "These bindings carry link pragmas, so tauraroc links them\n"
+        g = g + "AUTOMATICALLY (zero-cost — LTO inlines the shim wrapper away):\n"
+        if prag.get(0) != "": g = g + "    shim     : src/" + prag.get(0) + "  (auto-compiled)\n"
+        if prag.get(1) != "": g = g + "    C++ lib  : " + prag.get(1) + "\n"
+        if prag.get(2) != "": g = g + "    libraries:" + prag.get(2) + "\n"
+        if prag.get(3) != "": g = g + "    cflags   : " + prag.get(3) + "\n"
+        g = g + "\nNo manual -l/-I flags are needed for the above.\n\n"
+    else:
+        g = g + "No link pragmas were emitted (pure C header). If the underlying\n"
+        g = g + "library is a separate shared/static lib, link it when building:\n\n"
+        mut guessed = _collect_guesses(sys_inc)
+        if guessed != "":
+            g = g + "    likely:  tauraroc yourapp.tr " + guessed + "\n\n"
+        else:
+            g = g + "    e.g.:    tauraroc yourapp.tr -l<libname>\n\n"
+
+    g = g + "To compile an app directly with tauraroc (no taupkg), export the\n"
+    g = g + "search path first:  run `taupkg env` in your project and use its output.\n\n"
+
+    g = g + "--------------------------------------------------------------\n"
+    g = g + " 3. HEADER DEPENDENCIES (from #include scan)\n"
+    g = g + "--------------------------------------------------------------\n"
+    if sys_inc.len == 0 and loc_inc.len == 0:
+        g = g + "(none detected — header may be a system path not read directly)\n\n"
+    else:
+        if sys_inc.len > 0:
+            g = g + "System includes (need the library's dev package installed):\n"
+            mut i = 0
+            while i < sys_inc.len:
+                mut gl = _guess_link(sys_inc.get(i))
+                mut note = ""
+                if gl != "": note = "   → likely link: " + gl
+                g = g + "    <" + sys_inc.get(i) + ">" + note + "\n"
+                i = i + 1
+            g = g + "\n"
+        if loc_inc.len > 0:
+            g = g + "Local includes (bundled alongside the header):\n"
+            mut j = 0
+            while j < loc_inc.len:
+                g = g + "    \"" + loc_inc.get(j) + "\"\n"
+                j = j + 1
+            g = g + "\n"
+
+    g = g + "--------------------------------------------------------------\n"
+    g = g + " 4. SYMBOL INVENTORY (" + str(symbols.len) + " total)\n"
+    g = g + "--------------------------------------------------------------\n"
+    mut sc = 0
+    while sc < symbols.len and sc < 60:
+        g = g + "    " + symbols.get(sc) + "\n"
+        sc = sc + 1
+    if symbols.len > 60:
+        g = g + "    ... and " + str(symbols.len - 60) + " more (see src/" + name + ".tr)\n"
+    g = g + "\n"
+
+    g = g + "--------------------------------------------------------------\n"
+    g = g + " 5. REGENERATE\n"
+    g = g + "--------------------------------------------------------------\n"
+    g = g + "This exact command produced the bindings:\n\n"
+    g = g + "    " + cmd + "\n\n"
+    g = g + "(also recorded under [bindgen] in taupkg.toml)\n"
+
+    File.write_text(path_join(pkg_dir, "guide.txt"), g)
+
+def _collect_guesses(sys_inc: Vec[str]) -> str:
+    mut out = ""
+    mut i = 0
+    while i < sys_inc.len:
+        mut gl = _guess_link(sys_inc.get(i))
+        if gl != "" and out.index_of(gl) < 0:
+            if out.len() > 0: out = out + " "
+            out = out + gl
+        i = i + 1
+    return out
+
+# The identifier of the first def/class symbol, for a sample import line.
+def _first_symbol_id(symbols: Vec[str]) -> str:
+    mut i = 0
+    while i < symbols.len:
+        mut s = symbols.get(i)
+        mut kw = ""
+        if s.starts_with("pub def "): kw = s.slice(8, s.len())
+        elif s.starts_with("def "): kw = s.slice(4, s.len())
+        elif s.starts_with("pub class "): kw = s.slice(10, s.len())
+        elif s.starts_with("class "): kw = s.slice(6, s.len())
+        if kw != "":
+            mut nm = ""
+            mut k = 0
+            while k < kw.len():
+                mut c = kw.char_at(k)
+                mut ok = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 95
+                if not ok: break
+                nm = nm + kw.slice(k, k + 1)
+                k = k + 1
+            if nm != "": return nm
+        i = i + 1
+    return ""

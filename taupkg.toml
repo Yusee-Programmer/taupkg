@@ -1,6 +1,6 @@
 [package]
 name    = "taupkg"
-version = "0.0.1"
+version = "0.0.2"
 desc    = "Official package manager for the Tauraro language"
 authors = ["Yusee Habibu <yusee201520@gmail.com>"]
 license = "MIT"

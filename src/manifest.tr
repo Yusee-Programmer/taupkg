@@ -10,9 +10,13 @@ pub class Manifest:
     pub license: str
     pub bin: str
     pub authors: Vec[str]
-    pub deps: Map[str, str]
-    pub build_deps: Map[str, str]
-    pub sources: Map[str, str]
+    pub deps: Map[str, str]        # [deps]           — runtime dependencies
+    pub dev_deps: Map[str, str]    # [dev-deps]       — test/example-only, not shipped to consumers
+    pub build_deps: Map[str, str]  # [build-deps]     — build-script-only
+    pub sources: Map[str, str]     # [sources]        — explicit source override per dep
+    pub features: Map[str, str]    # [features]       — feature name -> comma list of implied features
+    pub default_features: str      # [features].default
+    pub workspace_members: Vec[str] # [workspace] members = [ ... ]
 
 extend Manifest:
     pub def init() -> Manifest:
@@ -24,12 +28,19 @@ extend Manifest:
         m.bin = ""
         m.authors = Vec[str].init(4)
         m.deps = Map[str, str].init(8)
+        m.dev_deps = Map[str, str].init(4)
         m.build_deps = Map[str, str].init(4)
         m.sources = Map[str, str].init(4)
+        m.features = Map[str, str].init(4)
+        m.default_features = ""
+        m.workspace_members = Vec[str].init(4)
         return m
 
     pub def is_valid(self) -> bool:
         return self.name.len() > 0 and self.version.len() > 0
+
+    pub def is_workspace(self) -> bool:
+        return self.workspace_members.len > 0
 
     pub def load(path: str) -> Manifest:
         mut m = Manifest.init()
@@ -45,11 +56,35 @@ extend Manifest:
         if pkg.keys.contains("authors"):
             m.authors.push(pkg.keys.get("authors"))
 
-        mut deps_sec   = doc.get_section("deps")
-        mut bdeps_sec  = doc.get_section("build-deps")
-        mut src_sec    = doc.get_section("sources")
-        m.deps         = deps_sec.keys
-        m.build_deps   = bdeps_sec.keys
-        m.sources      = src_sec.keys
+        # [deps] / [dependencies], [dev-deps], [build-deps], [sources] all merge their keys.
+        m.deps       = _merge_secs(doc, "deps", "dependencies")
+        m.dev_deps   = _merge_secs(doc, "dev-deps", "dev-dependencies")
+        m.build_deps = _merge_secs(doc, "build-deps", "build-dependencies")
+        m.sources    = doc.get_section("sources").keys
+        m.features   = doc.get_section("features").keys
+        if m.features.contains("default"):
+            m.default_features = m.features.get("default")
+
+        mut ws = doc.get_section("workspace")
+        if ws.keys.contains("members"):
+            mut raw = ws.keys.get("members")   # e.g.  ["crates/a", "crates/b"]  (kept as a string by the toml parser)
+            mut r = raw.trim()
+            if r.starts_with("["): r = r.slice(1, r.len())
+            if r.ends_with("]"):   r = r.slice(0, r.len() - 1)
+            for part in r.split(","):
+                mut member = part.trim()
+                if member.starts_with("\"") and member.ends_with("\"") and member.len() >= 2:
+                    member = member.slice(1, member.len() - 1)
+                if member.len() > 0:
+                    m.workspace_members.push(member)
 
         return m
+
+# Merge the keys of two possible section names (canonical + alias) into one Map.
+def _merge_secs(doc: TomlDoc, primary: str, alias: str) -> Map[str, str]:
+    mut out = doc.get_section(primary).keys
+    mut alt = doc.get_section(alias).keys
+    for k in alt.keys():
+        if not out.contains(k):
+            out.insert(k, alt.get(k))
+    return out

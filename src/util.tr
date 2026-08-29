@@ -2,6 +2,7 @@
 
 from std.io import File, Dir
 from std.os import OS, Process, Env
+from crypto.hash import Hash
 
 # Join two path segments with the platform separator.
 pub def path_join(a: str, b: str) -> str:
@@ -26,6 +27,94 @@ pub def path_normalize(p: str) -> str:
         else:
             out = out + p.slice(i, i + 1)
         i = i + 1
+    return out
+
+
+# True if a path is absolute: POSIX "/..." or "\\..." (UNC) or a Windows drive
+# root like "C:/..." / "C:\...".
+pub def path_is_absolute(p: str) -> bool:
+    if p.len() == 0: return false
+    mut c0 = p.char_at(0)
+    if c0 == 47 or c0 == 92:  # '/' or '\'
+        return true
+    if p.len() >= 2 and p.char_at(1) == 58:  # ':' → drive-letter root
+        return true
+    return false
+
+
+# Resolve `rel` against base directory `base`, collapsing "." and ".." segments,
+# and return a normalized (forward-slash) path. If `rel` is already absolute it is
+# returned normalized as-is. This is how a `path = "..."` dependency is anchored to
+# the directory of the manifest that DECLARES it (Cargo semantics).
+pub def path_resolve(base: str, rel: str) -> str:
+    mut combined = ""
+    if path_is_absolute(rel):
+        combined = path_normalize(rel)
+    else:
+        combined = path_normalize(base) + "/" + path_normalize(rel)
+    # Split into segments and collapse.
+    mut root = ""
+    mut rest = combined
+    if rest.starts_with("/"):
+        root = "/"
+        rest = rest.slice(1, rest.len())
+    elif rest.len() >= 2 and rest.char_at(1) == 58:  # "C:" drive prefix
+        root = rest.slice(0, 2) + "/"
+        rest = rest.slice(2, rest.len())
+        if rest.starts_with("/"): rest = rest.slice(1, rest.len())
+    mut stack = Vec[str].init(16)
+    for seg in rest.split("/"):
+        if seg.len() == 0 or seg == ".":
+            continue
+        if seg == "..":
+            if stack.len > 0 and stack.get(stack.len - 1) != "..":
+                stack.remove(stack.len - 1)
+            elif root.len() == 0:
+                stack.push("..")   # keep leading ".." on relative paths
+            continue
+        stack.push(seg)
+    mut out = root
+    mut i = 0
+    while i < stack.len:
+        if i > 0: out = out + "/"
+        out = out + stack.get(i)
+        i = i + 1
+    if out.len() == 0: out = "."
+    return out
+
+
+# Express absolute `target` relative to absolute directory `base` (both are
+# normalized first). Used so a rebased local dep is stored in the lock as a
+# project-root-relative path (portable across checkouts) rather than an absolute
+# machine-specific one. Falls back to the normalized target if they share no root.
+pub def path_relative(base: str, target: str) -> str:
+    mut b = path_normalize(base)
+    mut t = path_normalize(target)
+    mut bsegs = Vec[str].init(16)
+    for s in b.split("/"):
+        if s.len() > 0 and s != ".": bsegs.push(s)
+    mut tsegs = Vec[str].init(16)
+    for s in t.split("/"):
+        if s.len() > 0 and s != ".": tsegs.push(s)
+    # Longest common prefix.
+    mut common = 0
+    while common < bsegs.len and common < tsegs.len and bsegs.get(common) == tsegs.get(common):
+        common = common + 1
+    # A differing drive/root ⇒ no sensible relative form.
+    if common == 0 and bsegs.len > 0 and tsegs.len > 0:
+        return t
+    mut out = ""
+    mut i = common
+    while i < bsegs.len:
+        if out.len() > 0: out = out + "/"
+        out = out + ".."
+        i = i + 1
+    i = common
+    while i < tsegs.len:
+        if out.len() > 0: out = out + "/"
+        out = out + tsegs.get(i)
+        i = i + 1
+    if out.len() == 0: out = "."
     return out
 
 
@@ -147,6 +236,24 @@ pub def shell_capture(cmd: str) -> str:
     return Process.shell_output(cmd).trim()
 
 
+# Quote a single command-line token ONLY when it needs it (contains a space, or
+# is empty). Quoting a space-free first token would trip cmd.exe's `cmd /c "a" "b"`
+# quote-stripping rule, so a bare `tauraroc.exe` must stay unquoted.
+pub def shell_quote(s: str) -> str:
+    if s.len() == 0: return "\"\""
+    if s.index_of(" ") >= 0: return "\"" + s + "\""
+    return s
+
+
+# Run a shell command robustly across platforms. On Windows the whole line is
+# wrapped in an outer quote pair so `cmd /c` strips exactly those and preserves
+# any interior quoting (the canonical fix for quoted paths on Windows).
+pub def shell_run(cmd: str) -> int:
+    if OS.is_windows():
+        return Process.system("\"" + cmd + "\"")
+    return Process.system(cmd)
+
+
 # Check whether a command is available on PATH.
 pub def cmd_exists(name: str) -> bool:
     if OS.is_windows():
@@ -182,3 +289,61 @@ pub def project_pkg_dir(project_root: str) -> str:
 # Return the build sandbox directory: .taupkg/build
 pub def project_build_dir(project_root: str) -> str:
     return path_join(project_root, ".taupkg/build")
+
+
+# Global content-addressed store: ~/.taupkg/store/<hash>/
+pub def store_dir() -> str:
+    return path_join(taupkg_home(), "store")
+
+
+# Credentials file for `taupkg login`: ~/.taupkg/credentials
+pub def credentials_path() -> str:
+    return path_join(taupkg_home(), "credentials")
+
+
+# ── integrity: a Merkle-ish content hash of a whole package tree ──────────────
+# Hashes every file's (relative-path, sha256(content)) pair, order-independent
+# (sorted), so two identical trees always produce the same digest. Excludes VCS
+# and build junk. This is the checksum stored in the lock and re-verified on build.
+pub def hash_tree(root: str) -> str:
+    mut lines = Vec[str].init(64)
+    _hash_tree_walk(root, "", lines)
+    _sort_str(lines)
+    mut combined = ""
+    mut i = 0
+    while i < lines.len:
+        combined = combined + lines.get(i) + "\n"
+        i = i + 1
+    return "sha256:" + Hash.sha256(combined)
+
+def _hash_tree_walk(dir: str, prefix: str, out: Vec[str]):
+    if not File.dir_exists(dir):
+        return
+    mut entries = Dir.init(dir).list()
+    mut i = 0
+    while i < entries.len:
+        mut name = entries.get(i)
+        i = i + 1
+        if name == "." or name == "..": continue
+        if name == ".git" or name == ".taupkg" or name == "build" or name == "target": continue
+        if name == "taupkg.sig": continue   # the signature file signs the hash of everything ELSE
+        mut full = path_join(dir, name)
+        mut rel = name
+        if prefix.len() > 0: rel = prefix + "/" + name
+        if File.dir_exists(full):
+            _hash_tree_walk(full, rel, out)
+        elif File.file_exists(full):
+            mut content = File.read_text(full)
+            out.push(rel + ":" + Hash.sha256(content))
+
+# In-place insertion sort of a Vec[str] (small dep trees; determinism > speed).
+def _sort_str(v: Vec[str]):
+    mut i = 1
+    while i < v.len:
+        mut key = v.get(i)
+        mut j = i - 1
+        while j >= 0 and v.get(j) > key:
+            v.set(j + 1, v.get(j))
+            j = j - 1
+        v.set(j + 1, key)
+        i = i + 1

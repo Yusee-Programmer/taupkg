@@ -1,0 +1,115 @@
+# Ed25519 package signing for taupkg.
+#
+# A publisher holds an ed25519 keypair. `taupkg publish` signs the package's
+# content checksum with the private key; consumers verify the signature against a
+# trusted public key. Signing binds a publisher identity to exact content, on top
+# of the tamper-evident checksum.
+#
+# Key material lives under ~/.taupkg/:
+#   keys/<name>.key        — the 32-byte seed (private key), hex; keep secret
+#   trusted-keys.toml      — public keys you trust ([[key]] name/pubkey)
+#
+# Signatures cover the package's full-tree checksum string (already in the lock),
+# so verification needs no access to the original archive.
+
+from std.io import File
+from std.crypto.ed25519 import Ed25519
+from toml import toml_load
+from util import taupkg_home, path_join, mkdir_p, hash_tree
+
+pub def keys_dir() -> str:
+    return path_join(taupkg_home(), "keys")
+
+pub def key_path(name: str) -> str:
+    return path_join(keys_dir(), name + ".key")
+
+pub def trusted_keys_path() -> str:
+    return path_join(taupkg_home(), "trusted-keys.toml")
+
+# Generate a keypair for `name`, store the seed, return the public key (hex).
+# Refuses to overwrite an existing key.
+pub def key_generate(name: str) -> str:
+    if File.file_exists(key_path(name)):
+        return ""
+    mkdir_p(keys_dir())
+    mut seed = Ed25519.gen_seed()
+    File.write_text(key_path(name), seed + "\n")
+    return Ed25519.pubkey(seed)
+
+# The public key for a stored private key, or "" if the key doesn't exist.
+pub def key_pubkey(name: str) -> str:
+    if not File.file_exists(key_path(name)):
+        return ""
+    mut seed = File.read_text(key_path(name)).trim()
+    if seed.len() < 64:
+        return ""
+    return Ed25519.pubkey(seed)
+
+# Sign an arbitrary message with the named key. Returns the 128-hex signature.
+pub def sign_message(msg: str, name: str) -> str:
+    if not File.file_exists(key_path(name)):
+        return ""
+    mut seed = File.read_text(key_path(name)).trim()
+    if seed.len() < 64:
+        return ""
+    return Ed25519.sign(msg, seed)
+
+# Verify a detached signature over `msg` against `pubkey`.
+pub def verify_message(msg: str, sig: str, pubkey: str) -> bool:
+    return Ed25519.verify(msg, sig, pubkey)
+
+# ── trusted keys ──────────────────────────────────────────────────────────────
+
+# Add a public key to the trusted set (idempotent append; TOML array-of-tables).
+pub def trust_key(pubkey: str, label: str):
+    mut existing = ""
+    if File.file_exists(trusted_keys_path()):
+        existing = File.read_text(trusted_keys_path())
+    if existing.contains(pubkey):
+        return
+    mut entry = "\n[[key]]\nname   = \"" + label + "\"\npubkey = \"" + pubkey + "\"\n"
+    mkdir_p(taupkg_home())
+    File.write_text(trusted_keys_path(), existing + entry)
+
+# True if `pubkey` is in the trusted-keys file.
+pub def is_trusted(pubkey: str) -> bool:
+    if pubkey.len() == 0: return false
+    if not File.file_exists(trusted_keys_path()): return false
+    mut doc = toml_load(trusted_keys_path())
+    for sec in doc.get_array("key"):
+        if sec.keys.contains("pubkey") and sec.keys.get("pubkey") == pubkey:
+            return true
+    return false
+
+# ── package signature verification ────────────────────────────────────────────
+# A signed package ships a `taupkg.sig` at its root (pubkey/signature/checksum).
+# verify_package returns a status for `taupkg audit`:
+#   0 = unsigned (no taupkg.sig)
+#   1 = signature valid AND the signing key is trusted
+#   2 = signature valid but the signing key is NOT trusted
+#   3 = signature INVALID (bad sig, or content no longer matches the signed hash)
+pub def verify_package(dir: str) -> int:
+    mut sigf = path_join(dir, "taupkg.sig")
+    if not File.file_exists(sigf): return 0
+    mut doc = toml_load(sigf)
+    mut sec = doc.get_section("_root")
+    mut pubkey = ""
+    mut signature = ""
+    mut checksum = ""
+    if sec.keys.contains("pubkey"):    pubkey    = sec.keys.get("pubkey")
+    if sec.keys.contains("signature"): signature = sec.keys.get("signature")
+    if sec.keys.contains("checksum"):  checksum  = sec.keys.get("checksum")
+    if pubkey.len() == 0 or signature.len() == 0 or checksum.len() == 0: return 3
+    # The signed checksum must match the package's actual content (taupkg.sig excluded).
+    if hash_tree(dir) != checksum: return 3
+    if not verify_message(checksum, signature, pubkey): return 3
+    if is_trusted(pubkey): return 1
+    return 2
+
+# Public-key recorded in a package's taupkg.sig (or "" if unsigned/missing).
+pub def package_signer(dir: str) -> str:
+    mut sigf = path_join(dir, "taupkg.sig")
+    if not File.file_exists(sigf): return ""
+    mut sec = toml_load(sigf).get_section("_root")
+    if sec.keys.contains("pubkey"): return sec.keys.get("pubkey")
+    return ""
