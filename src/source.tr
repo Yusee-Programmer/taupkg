@@ -73,6 +73,13 @@ pub def dep_constraint(raw: str) -> str:
         mut tbl = _parse_inline_table(s)
         if tbl.contains("version"): return tbl.get("version")
         return "*"
+    # A source-based spec (local:/github:/git:/archive:/http) pins an exact checkout
+    # — it provides one version and imposes NO semver range, so its constraint is "*".
+    # (Returning the raw source string here made the resolver validate the resolved
+    # version against e.g. "local:../..", which no version satisfies.) Only a BARE
+    # version string ("^1.2", "~1.0", ">=1.3", "1.2.3", "*") is a real constraint.
+    if s.starts_with("local:") or s.starts_with("github:") or s.starts_with("git:") or s.starts_with("archive:") or s.starts_with("http://") or s.starts_with("https://"):
+        return "*"
     return s
 
 # True if a dependency is declared optional (`{ ..., optional = true }`).
@@ -165,8 +172,13 @@ pub def parse_source(pkg_name: str, raw: str) -> Source:
     return Source.init("registry", pkg_name, s)
 
 
-# Build the git clone command for a git/github source.
+# Build the git clone command for a git/github source. The uri and dest are
+# QUOTED so a path containing a space (e.g. C:\Users\First Last\...) doesn't split
+# into extra args and make git dump its usage. Run via shell_run, which adds the
+# Windows outer-quote wrapper so cmd /c preserves this interior quoting.
 pub def source_clone_cmd(src: Source, dest_dir: str) -> str:
+    mut u = "\"" + src.uri + "\""
+    mut d = "\"" + dest_dir + "\""
     if src.ref.len() > 0:
-        return "git clone --depth 1 --branch " + src.ref + " " + src.uri + " " + dest_dir
-    return "git clone --depth 1 " + src.uri + " " + dest_dir
+        return "git clone --depth 1 --branch " + src.ref + " " + u + " " + d
+    return "git clone --depth 1 " + u + " " + d
