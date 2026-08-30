@@ -10,7 +10,7 @@
 
 from std.io import File
 from std.os import OS, Process
-from util import path_join, mkdir_p, rm_rf, rm_f, cp_r, flatten_single_subdir, shell_capture, project_pkg_dir, hash_tree, path_resolve
+from util import path_join, mkdir_p, rm_rf, rm_f, cp_r, flatten_single_subdir, shell_capture, shell_run, project_pkg_dir, hash_tree, path_resolve
 from source import Source, parse_source, source_clone_cmd
 from manifest import Manifest
 from lockfile import LockedPkg
@@ -57,7 +57,7 @@ pub def install_package(
         mut cmd = source_clone_cmd(src, pkg_dir)
         if verbose:
             print("  [git] " + cmd)
-        mut rc = Process.system(cmd)
+        mut rc = shell_run(cmd)
         if rc != 0:
             print("error: git clone failed for " + pkg_name)
             return LockedPkg.init("", "", "", "")
@@ -111,7 +111,7 @@ pub def install_package(
             print("  [registry] " + pkg_name + "@" + reg_result.version + " -> " + reg_result.clone_url)
         mut git_src = Source.init("git", reg_result.clone_url, reg_result.tag)
         mut cmd = source_clone_cmd(git_src, pkg_dir)
-        mut rc = Process.system(cmd)
+        mut rc = shell_run(cmd)
         if rc != 0:
             print("error: failed to fetch " + pkg_name + " from registry")
             return LockedPkg.init("", "", "", "")

@@ -117,8 +117,18 @@ jobs:
       - name: Build taupkg
         shell: bash
         run: |
-          "$TAURAROC" src/main.tr -o "taupkg${{ matrix.ext }}"
-          echo "Built: taupkg${{ matrix.ext }}"
+          # Windows: link statically so the distributed taupkg.exe carries no MinGW
+          # runtime DLL deps (libwinpthread-1.dll / libgcc_s / libstdc++) — those exist
+          # on the build box but not on a clean Windows install, which otherwise fails
+          # with "libwinpthread-1.dll was not found". On Linux/macOS a dynamic binary
+          # against system libc is portable across distros, so no --static there
+          # (static glibc + getpwuid/NSS is fragile and buys nothing here).
+          STATIC=""
+          case "${{ matrix.platform }}" in
+            windows-*) STATIC="--static" ;;
+          esac
+          "$TAURAROC" src/main.tr -o "taupkg${{ matrix.ext }}" $STATIC
+          echo "Built: taupkg${{ matrix.ext }} $STATIC"
 
       - name: Verify binary
         shell: bash
