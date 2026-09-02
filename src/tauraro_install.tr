@@ -113,26 +113,35 @@ pub def curl_download(url: str, dest: str, verbose: bool) -> int:
 
 # -- extraction ----------------------------------------------------------------
 
-# Extract zip into dest_dir, preserving the top-level folder inside the zip.
-# After this, dest_dir/tauraroc-{os}-{arch}/ contains the binary + runtime/ + std/.
-pub def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
+# Recursively remove a file or directory, ignoring "not found".
+def _rmrf(path: str, os_name: str):
     if os_name == "windows":
-        # PowerShell Expand-Archive works reliably with Windows paths (including spaces
-        # and drive letters that confuse Git-Bash tar). Silence its built-in progress
-        # widget so only taupkg's own UI shows.
-        mut cmd = "powershell -Command \"$ProgressPreference='SilentlyContinue'; Expand-Archive -Force -Path '" + zip_path + "' -DestinationPath '" + dest_dir + "'\""
-        mut rc = Process.system(cmd)
+        Process.system("rmdir /s /q \"" + path + "\" 2>nul")
+        Process.system("del /f /q \"" + path + "\" 2>nul")
+    else:
+        Process.system("rm -rf \"" + path + "\"")
+
+# Extract zip into dest_dir. `dest_dir` must already exist.
+# bsdtar (`tar`) reads .zip and ships on Windows 10+, macOS, and most Linux; it is
+# far faster than PowerShell's Expand-Archive (which crawls file-by-file and made
+# the zig-bundled archive feel like it hung). Try tar first everywhere, then fall
+# back to the platform-native unzip so old boxes still work.
+pub def extract_zip(zip_path: str, dest_dir: str, os_name: str) -> int:
+    mut cmd = "tar -xf \"" + zip_path + "\" -C \"" + dest_dir + "\""
+    mut rc = Process.system(cmd)
+    if rc == 0:
+        return 0
+    if os_name == "windows":
+        cmd = "powershell -Command \"$ProgressPreference='SilentlyContinue'; Expand-Archive -Force -Path '" + zip_path + "' -DestinationPath '" + dest_dir + "'\""
+        rc = Process.system(cmd)
         if rc != 0:
-            # Fallback: unzip via Git Bash (available on most Windows dev machines)
             cmd = "unzip -oq \"" + zip_path + "\" -d \"" + dest_dir + "\""
             rc = Process.system(cmd)
         return rc
     else:
-        # unzip preserves the top-level directory from the zip
-        mut cmd = "unzip -oq \"" + zip_path + "\" -d \"" + dest_dir + "\""
-        mut rc = Process.system(cmd)
+        cmd = "unzip -oq \"" + zip_path + "\" -d \"" + dest_dir + "\""
+        rc = Process.system(cmd)
         if rc != 0:
-            # Fallback: Python (available on almost every system)
             cmd = "python3 -c \"import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])\" \"" + zip_path + "\" \"" + dest_dir + "\""
             rc = Process.system(cmd)
         return rc
@@ -243,57 +252,65 @@ pub def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
             print("       Check that version " + ver + " exists for " + os_name + "-" + arch + ".")
             return 1
 
-    # Extract -- zip contains tauraroc-{os}-{arch}/ as top-level folder
+    # Extract into a STAGING dir, then install ONLY the SDK folder. The release
+    # archive's SDK lives in a top-level `tauraroc-{os}-{arch}/` folder (binary +
+    # runtime/ + std/ + zig/). Any stray siblings it may carry (src/, benchmarks/,
+    # examples/, a .sha256) stay in staging and are discarded — so nothing leaks
+    # into ~/.taupkg/bin/ alongside the versioned SDK folder.
     print("  " + dim("extracting…"))
-    mut ex_rc = extract_zip(zip_path, bin_root, os_name)
+    mut staging = path_join(bin_root, ".staging-" + pkg_stem)
+    _rmrf(staging, os_name)
+    mkdir_p(staging)
+    mut ex_rc = extract_zip(zip_path, staging, os_name)
     if ex_rc != 0:
         print("error: extraction failed.")
         if os_name != "windows":
-            print("       Make sure 'unzip' is installed (apt install unzip / brew install unzip).")
+            print("       Make sure 'tar' or 'unzip' is installed (apt install unzip / brew install unzip).")
+        _rmrf(staging, os_name)
         return 1
 
-    # Remove zip file
+    mut bin_name = "tauraroc"
+    if os_name == "windows":
+        bin_name = "tauraroc.exe"
+
+    # The SDK content root: the wrapper folder if present, else staging itself
+    # (a flat zip that extracted the binary directly).
+    mut content = path_join(staging, pkg_stem)
+    if not File.file_exists(path_join(content, bin_name)):
+        if File.file_exists(path_join(staging, bin_name)):
+            content = staging
+        else:
+            print("error: could not find " + bin_name + " inside the archive.")
+            _rmrf(staging, os_name)
+            return 1
+
+    # Install: content -> install_dir (install_dir was already removed above, so
+    # `move`/`mv` renames the folder into place — the whole SDK, zig included).
+    if os_name == "windows":
+        Process.system("move /y \"" + content + "\" \"" + install_dir + "\" >nul 2>nul")
+    else:
+        Process.system("mv \"" + content + "\" \"" + install_dir + "\"")
+    # Discard the staging tree (any leftover siblings) and the downloaded zip.
+    _rmrf(staging, os_name)
     if os_name == "windows":
         Process.system("del /f /q \"" + zip_path + "\" 2>nul")
     else:
         Process.system("rm -f \"" + zip_path + "\"")
 
-    # Locate the binary inside the extracted tree.
-    # New zips have layout: tauraroc-{platform}/tauraroc[.exe]
-    # Legacy zips (full-repo) have the binary at the root of bin_root.
-    mut bin_name = "tauraroc"
-    if os_name == "windows":
-        bin_name = "tauraroc.exe"
+    # Sweep stray top-level items an older (buggy) extraction may have spilled
+    # directly into bin/ — bin/ must hold only versioned SDK folders.
+    _rmrf(path_join(bin_root, "src"), os_name)
+    _rmrf(path_join(bin_root, "examples"), os_name)
+    _rmrf(path_join(bin_root, "benchmarks"), os_name)
+    _rmrf(path_join(bin_root, "runtime"), os_name)
+    _rmrf(path_join(bin_root, "std"), os_name)
+    _rmrf(path_join(bin_root, pkg_stem + ".sha256"), os_name)
 
-    # Preferred: structured subfolder
     mut bin_path = path_join(install_dir, bin_name)
     if not File.file_exists(bin_path):
-        # Fallback: flat zip extracted directly into bin_root
-        mut flat_bin = path_join(bin_root, bin_name)
-        if File.file_exists(flat_bin):
-            # Move it into the expected subfolder so PATH points correctly
-            mkdir_p(install_dir)
-            if os_name == "windows":
-                Process.system("move /y \"" + flat_bin + "\" \"" + install_dir + "\" 2>nul")
-            else:
-                Process.system("mv \"" + flat_bin + "\" \"" + install_dir + "/\"")
-            # Also move runtime/ and std/ if present at bin_root level
-            mut rt_src = path_join(bin_root, "runtime")
-            mut std_src = path_join(bin_root, "std")
-            if File.dir_exists(rt_src):
-                if os_name == "windows":
-                    Process.system("move /y \"" + rt_src + "\" \"" + install_dir + "\" 2>nul")
-                else:
-                    Process.system("mv \"" + rt_src + "\" \"" + install_dir + "/\"")
-            if File.dir_exists(std_src):
-                if os_name == "windows":
-                    Process.system("move /y \"" + std_src + "\" \"" + install_dir + "\" 2>nul")
-                else:
-                    Process.system("mv \"" + std_src + "\" \"" + install_dir + "/\"")
-        else:
-            print("error: could not find tauraroc binary after extraction.")
-            print("       Expected: " + bin_path)
-            return 1
+        print("error: could not find tauraroc binary after extraction.")
+        print("       Expected: " + bin_path)
+        return 1
 
     # Ensure executable on Unix
     if os_name != "windows":
@@ -311,10 +328,26 @@ pub def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
         print("  (could not verify binary -- it may still work)")
 
     print("")
-    print("Installed:")
+    print("Installed to " + install_dir)
     print("  binary:  " + bin_path)
     print("  runtime: " + path_join(install_dir, "runtime/tauraro_rt.h"))
     print("  std:     " + path_join(install_dir, "std/"))
+    # Show every top-level item that landed in the SDK folder (binary, runtime,
+    # std, zig, …) so the install is transparent — not just the three headline paths.
+    mut listing = ""
+    if os_name == "windows":
+        listing = shell_capture("dir /b /a \"" + install_dir + "\"")
+    else:
+        listing = shell_capture("ls -1A \"" + install_dir + "\"")
+    print("  contents:")
+    for line in listing.split("\n"):
+        mut item = line.trim()
+        if item.len() > 0:
+            mut full = path_join(install_dir, item)
+            if File.dir_exists(full):
+                print("             " + item + "/")
+            else:
+                print("             " + item)
     print("")
 
     # Add install_dir to PATH so `tauraroc` is found directly
@@ -323,4 +356,6 @@ pub def install_tauraro(version: str, use_mirror: bool, verbose: bool) -> int:
     else:
         setup_path_unix(install_dir)
 
+    print("")
+    print(green("Finished ✓") + "  tauraroc " + ver + " is ready.")
     return 0
