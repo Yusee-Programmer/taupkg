@@ -9,6 +9,11 @@ pub class Manifest:
     pub desc: str
     pub license: str
     pub bin: str
+    pub build: str                 # [package] build   — a build script (Cargo build.rs equivalent),
+                                    #                     compiled + run once before the main build
+    pub links: str                 # [package] links   — the native lib this package's build script
+                                    #                     links; at most one package per resolved
+                                    #                     graph may claim a given value (see buildscript.tr)
     pub authors: Vec[str]
     pub deps: Map[str, str]        # [deps]           — runtime dependencies
     pub dev_deps: Map[str, str]    # [dev-deps]       — test/example-only, not shipped to consumers
@@ -26,6 +31,8 @@ extend Manifest:
         m.desc = ""
         m.license = "MIT"
         m.bin = ""
+        m.build = ""
+        m.links = ""
         m.authors = Vec[str].init(4)
         m.deps = Map[str, str].init(8)
         m.dev_deps = Map[str, str].init(4)
@@ -51,6 +58,8 @@ extend Manifest:
         if pkg.keys.contains("version"): m.version = pkg.keys.get("version")
         if pkg.keys.contains("desc"):    m.desc    = pkg.keys.get("desc")
         if pkg.keys.contains("bin"):     m.bin     = pkg.keys.get("bin")
+        if pkg.keys.contains("build"):   m.build   = pkg.keys.get("build")
+        if pkg.keys.contains("links"):   m.links   = pkg.keys.get("links")
         if pkg.keys.contains("license"):
             m.license = pkg.keys.get("license")
         if pkg.keys.contains("authors"):
