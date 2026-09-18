@@ -29,9 +29,35 @@ from progress import download_with_progress, fmt_bytes, green, dim, cyan
 
 # -- platform detection --------------------------------------------------------
 
+# Termux (the standard way to run a real Linux userland on Android) always sets
+# PREFIX to its own sandboxed filesystem root, e.g.
+# /data/data/com.termux/files/usr -- this is the one signal that's both always
+# present under Termux and never present anywhere else, so it's checked first.
+# `uname -o` reporting "Android" is a secondary confirmation (present on most
+# but not strictly all Termux builds); the filesystem path is the fallback of
+# last resort in case both environment signals are somehow stripped.
+pub def is_android_termux() -> bool:
+    mut prefix = Env.get_var("PREFIX")
+    if prefix.contains("com.termux"):
+        return true
+    mut o = shell_capture("uname -o")
+    if o.contains("Android"):
+        return true
+    return File.dir_exists("/data/data/com.termux/files/usr")
+
 pub def detect_os() -> str:
     if OS.is_windows():
         return "windows"
+    # Must be checked BEFORE the generic Linux fallback below: Termux also
+    # reports `uname -s` = "Linux", but a "linux-*" build is dynamically linked
+    # against the host distro's glibc with a hardcoded dynamic-linker path that
+    # doesn't exist under Termux's own filesystem layout (/data/data/com.termux/
+    # files/usr/...) -- it fails with linker/loader errors instead of running.
+    # The android-arm64 release asset is a statically-linked build made
+    # specifically to run under Termux; see the tauraro repo's
+    # `build-termux-android` CI job for the full reasoning.
+    if is_android_termux():
+        return "android"
     mut s = shell_capture("uname -s")
     if s.contains("Darwin"):
         return "macos"

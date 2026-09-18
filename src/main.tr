@@ -3,7 +3,7 @@
 
 from std.io import File, Dir
 from std.os import OS, Process, Env
-from cli import parse_args, print_usage, CliArgs
+from cliargs import parse_args, print_usage, CliArgs
 from manifest import Manifest
 from lockfile import Lockfile, LockedPkg
 from semver import Version
