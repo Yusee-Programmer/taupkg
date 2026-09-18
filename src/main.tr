@@ -35,7 +35,7 @@ def main(argv: Vec[str]):
         return 0
 
     if args.command == "version":
-        print("taupkg 0.0.2")
+        print("taupkg 0.0.3")
         return 0
 
     if args.command == "install-tauraro":

@@ -7,9 +7,34 @@ dependency resolution, downloading, integrity verification, building, publishing
 and — new in 0.0.2 — **automatic module-path resolution** and **FFI binding
 generation** from C/C++ headers.
 
-**Version: 0.0.2**
+**Version: 0.0.3** — see [`note.md`](note.md) for the full release notes.
 
 ---
+
+## What's new in 0.0.3
+
+- **Android support** — `taupkg` itself now ships a statically-linked
+  `android-arm64` build (runs under Termux and proot-based distros like
+  UserLAnd/Andronix/GNURoot alike), and `install-tauraro` correctly
+  detects any of those environments (not just Termux) and installs the
+  matching `tauraroc` `android-arm64` build instead of a `linux-arm64`
+  build that can't run there.
+- **Resumable downloads** — every large download (`install-tauraro`'s SDK
+  zip, and `archive:`-sourced dependency downloads) now resumes from
+  where it left off after a dropped connection, a cancel, or the process
+  being killed, instead of restarting from zero.
+- **Native (C/C++) build scripts** — a Cargo `build.rs` equivalent:
+  `[package] build = "build.tr"` runs a normal Tauraro program before
+  `build`/`install`/`test` compiles anything (fetch/compile a native
+  dependency, then patch in a `# tauraro-cpp-linkflags:` pragma), and
+  `[package] links = "pq"` catches two packages in the same dependency
+  graph trying to link the same native library. See
+  [`docs/native-build-scripts.md`](docs/native-build-scripts.md).
+- **`install-tauraro` extraction hardened** — switched to `tar` first
+  (falling back to the platform-native unzip), extracts into a staging
+  directory so stray archive siblings can never leak into
+  `~/.taupkg/bin/`, and sweeps any stray leftovers an older extraction
+  may have spilled there.
 
 ## What's new in 0.0.2
 
@@ -714,7 +739,10 @@ Download and install the Tauraro compiler from GitHub releases (or the
 | `--mirror` | Use `tauraro.org` mirror instead of GitHub |
 
 The compiler is installed to `~/.taupkg/bin/tauraroc-{os}-{arch}/` and added to
-your `PATH`. Supported platforms: linux-x64, linux-arm64, windows-x64, macos-arm64.
+your `PATH`. Supported platforms: linux-x64, linux-arm64, windows-x64,
+macos-arm64, and android-arm64 (auto-detected under Termux or a proot-based
+distro like UserLAnd/Andronix/GNURoot — no separate flag needed). The download
+resumes automatically if it's interrupted; just re-run the same command.
 
 ---
 
