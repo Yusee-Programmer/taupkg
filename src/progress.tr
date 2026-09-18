@@ -170,44 +170,120 @@ def _render(label: str, cur: int, total: int, bps: int):
             line = line + "  eta " + _fmt_time((total - cur) / bps)
     Console.print(line + "          ")
 
-# Single foreground download with curl's own bar (used when the size is unknown or
-# the server doesn't support HTTP range requests).
+# ── resumable downloads ──────────────────────────────────────────────────────
+#
+# A large download (the bundled-zig SDK zip can be 100+ MB) is exactly the kind
+# of transfer a flaky connection drops partway through, or that a user Ctrl+C's
+# out of. Rather than always restarting from zero, a small sidecar state file
+# next to `dest` records which URL its partial bytes belong to; the NEXT attempt
+# — whether the automatic foreground retry a few lines down, or a completely
+# fresh `taupkg install-tauraro` run after the process was killed — checks it
+# and resumes via curl's `-C -` (auto-detects the offset from the existing
+# file's size and requests that byte range from the server) instead of
+# re-downloading bytes that already landed on disk. The state file is written
+# BEFORE curl starts (not after success) specifically so a mid-download crash
+# still leaves enough on disk to resume from.
+#
+# This relies on the server honoring HTTP Range requests, which every asset
+# host taupkg actually downloads from (GitHub Releases, the tauraro.org mirror)
+# does. If a future source doesn't, worst case is a resume attempt re-fetches
+# the file from byte 0 appended after the stale partial — caught by the normal
+# "downloaded size != expected size" cases below, which discard and retry
+# clean rather than shipping a corrupt archive.
+
+def _progress_state_path(dest: str) -> str:
+    return dest + ".taupkg-progress"
+
+def _write_progress_state(dest: str, url: str):
+    File.write_text(_progress_state_path(dest), url)
+
+def _clear_progress_state(dest: str):
+    rm_f(_progress_state_path(dest))
+
+# True when `dest` already has partial bytes on disk AND its sidecar state file
+# confirms they belong to THIS `url` — not stale leftovers from a different
+# package/version that happened to reuse the same destination path (e.g. an
+# interrupted v0.0.8 download followed by `--version 0.0.9`).
+def _has_resumable_partial(url: str, dest: str) -> bool:
+    if not File.file_exists(dest):
+        return false
+    mut state_path = _progress_state_path(dest)
+    if not File.file_exists(state_path):
+        return false
+    mut saved_url = File.read_text(state_path).trim()
+    if saved_url != url:
+        return false
+    return File.file_size(dest) > 0
+
+# Single foreground download with curl's own bar (used when the size is unknown,
+# the server doesn't support HTTP range requests, or as the fallback retry when
+# the backgrounded/polled download below stalls out). Resumes automatically
+# when a matching partial download for this exact `url` is already on disk.
 def _single(url: str, dest: str, label: str) -> int:
-    rm_f(dest)
-    Console.println("  " + cyan("↓") + " " + label)
-    mut rc = Process.system("curl -# -fSL -o \"" + dest + "\" \"" + url + "\"")
+    mut resume = _has_resumable_partial(url, dest)
+    mut resume_flag = ""
+    if resume:
+        Console.println("  " + cyan("↻") + " " + label + " " + dim("(resuming from " + fmt_bytes(File.file_size(dest)) + ")"))
+        resume_flag = "-C - "
+    else:
+        rm_f(dest)
+        Console.println("  " + cyan("↓") + " " + label)
+    _write_progress_state(dest, url)
+    mut rc = Process.system("curl -# " + resume_flag + "-fSL -o \"" + dest + "\" \"" + url + "\"")
     if rc == 0:
         mut sz = File.file_size(dest)
         if sz < 0: sz = 0
         Console.println("  " + green("✓") + " " + dim("downloaded " + fmt_bytes(sz)))
+        _clear_progress_state(dest)
     return rc
 
-# Download `url` → `dest` with a live, custom progress bar. Downloads in HTTP
-# byte-range chunks, each a plain FOREGROUND curl (no backgrounding, threads, or
-# file polling), rendering the bar between chunks — so it behaves identically on
-# Windows, macOS, and Linux, and on paths with spaces. Falls back to a single curl
-# when the total size is unknown or the server ignores Range. Returns 0 on success.
+# Download `url` → `dest` with a live, custom progress bar: a single background
+# curl is launched and the growing destination file is polled every ~120ms to
+# redraw the bar — a continuously-live meter that behaves identically on
+# Windows, macOS, and Linux, and on paths with spaces. Falls back to a single
+# curl when the total size is unknown or the server ignores Range. Resumes a
+# matching interrupted download instead of restarting from zero (see the
+# "resumable downloads" note above). Returns 0 on success.
 pub def download_with_progress(url: str, dest: str, label: str) -> int:
     mut total = _content_length(url)
     if total <= 0:
         return _single(url, dest, label)     # unknown size — can't show a % bar
-    rm_f(dest)
+
+    mut resume = _has_resumable_partial(url, dest)
+    mut start_bytes = 0
+    if resume:
+        start_bytes = File.file_size(dest)
+        if start_bytes < 0: start_bytes = 0
+        # A "partial" already >= the full size is either a previous run that
+        # died after finishing the write but before clearing its state file,
+        # or corrupt — either way there's nothing to resume INTO. Restart clean.
+        if start_bytes >= total:
+            resume = false
+    if not resume:
+        rm_f(dest)
+        start_bytes = 0
+    _write_progress_state(dest, url)
+
+    mut resume_flag = ""
+    if resume: resume_flag = "-C - "
     # Launch curl in the BACKGROUND (non-blocking) and poll the growing file every
     # ~120ms, redrawing the bar — a continuously-live meter. `start "" /b` returns
     # immediately on Windows; `&` on POSIX. curl is silenced so nothing leaks.
     if OS.is_windows():
-        Process.system("start \"\" /b curl -s -fSL -o \"" + dest + "\" \"" + url + "\" 2>nul")
+        Process.system("start \"\" /b curl -s " + resume_flag + "-fSL -o \"" + dest + "\" \"" + url + "\" 2>nul")
     else:
-        Process.system("curl -s -fSL -o \"" + dest + "\" \"" + url + "\" >/dev/null 2>&1 &")
+        Process.system("curl -s " + resume_flag + "-fSL -o \"" + dest + "\" \"" + url + "\" >/dev/null 2>&1 &")
 
-    mut win_bytes = 0
+    mut win_bytes = start_bytes
     mut win_ms = Clock.now_ms()
     mut bps = 0
-    mut last = 0
+    mut last = start_bytes
     mut stall = 0                              # consecutive polls with no growth
     mut guard = 0
     _hide_cursor()                             # so the cursor doesn't jump during redraws
-    _render(label, 0, total, 0)
+    if resume:
+        Console.println("  " + cyan("↻") + " " + dim("resuming " + label + " from " + fmt_bytes(start_bytes)))
+    _render(label, start_bytes, total, 0)
     while guard < 200000:
         guard = guard + 1
         mut cur = File.file_size(dest)
@@ -217,6 +293,7 @@ pub def download_with_progress(url: str, dest: str, label: str) -> int:
             _show_cursor()
             Console.println("")
             Console.println("  " + green("✓") + " " + dim("downloaded " + fmt_bytes(total)))
+            _clear_progress_state(dest)
             return 0
         mut now = Clock.now_ms()
         if now - win_ms >= 500:                # instantaneous speed over ~0.5s window
@@ -227,8 +304,11 @@ pub def download_with_progress(url: str, dest: str, label: str) -> int:
         if cur == last: stall = stall + 1
         else: stall = 0
         last = cur
-        # ~30s with zero growth ⇒ the background curl died (network/HTTP error).
-        # Retry once in the FOREGROUND so the error is visible and we don't hang.
+        # ~30s with zero growth ⇒ the background curl died (network/HTTP error,
+        # dropped connection, etc). Retry once in the FOREGROUND so the error is
+        # visible and we don't hang -- _single() picks up the same partial file
+        # and resumes from wherever the background curl got to, it doesn't
+        # restart from zero.
         if stall > 250:
             _show_cursor()
             Console.println("")

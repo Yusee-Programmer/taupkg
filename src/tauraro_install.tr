@@ -29,9 +29,66 @@ from progress import download_with_progress, fmt_bytes, green, dim, cyan
 
 # -- platform detection --------------------------------------------------------
 
+# Android hosts a Linux userland several different ways -- Termux is the most
+# common, but proot-based distros (UserLAnd, Andronix, GNURoot, ...) run a real
+# Ubuntu/Debian/Alpine guest the same "linux-*" build would normally target.
+# None of those environments are reliably identifiable by app package name (new
+# ones appear constantly, and Termux itself ships under more than one package
+# id -- com.termux, com.termux.nightly, F-Droid vs. Play Store builds), so
+# detection is layered from most-specific to most-general and any match wins:
+#
+#   1. `getprop` succeeding is the strongest possible signal: it's an Android
+#      system binary (talks to Android's own property service) that simply
+#      does not exist on any non-Android Linux system, REGARDLESS of which
+#      terminal/distro app is hosting the shell -- Termux, a proot distro that
+#      bind-mounts /system, or anything else. This is checked first because it
+#      generalizes across every environment, not just the one we happened to
+#      think of.
+#   2. /system/build.prop existing -- part of the Android OS itself, visible
+#      from any environment that can see /system (Termux always can; most
+#      proot-based distros bind-mount the host filesystem too).
+#   3. ANDROID_ROOT / ANDROID_DATA env vars -- set by the Android runtime for
+#      native processes; not guaranteed to propagate into every proot's guest
+#      environment, but free to check and correct when present.
+#   4. Termux specifically: $PREFIX containing "termux" (covers every Termux
+#      package id, not just com.termux), `uname -o` reporting "Android", and
+#      the well-known filesystem path -- kept as the most specific fallback
+#      since Termux is still the single most common way to do this.
+pub def is_android() -> bool:
+    mut getprop_out = shell_capture("getprop ro.build.version.release 2>/dev/null")
+    if getprop_out.trim().len() > 0:
+        return true
+    if File.file_exists("/system/build.prop"):
+        return true
+    if Env.get_var("ANDROID_ROOT").len() > 0:
+        return true
+    if Env.get_var("ANDROID_DATA").len() > 0:
+        return true
+    mut prefix = Env.get_var("PREFIX")
+    if prefix.contains("termux"):
+        return true
+    mut o = shell_capture("uname -o")
+    if o.contains("Android"):
+        return true
+    return File.dir_exists("/data/data/com.termux/files/usr")
+
 pub def detect_os() -> str:
     if OS.is_windows():
         return "windows"
+    # Must be checked BEFORE the generic Linux fallback below: every Android
+    # Linux environment (Termux, proot-based distros, ...) still reports
+    # `uname -s` = "Linux", but a "linux-*" build is dynamically linked against
+    # its host distro's own glibc with a hardcoded dynamic-linker path that
+    # doesn't exist under Android's sandboxed filesystem layout -- it fails
+    # with linker/loader errors instead of running. The android-arm64 release
+    # asset is a statically-linked build with no such dependency, so it runs
+    # the same way regardless of which app/distro is hosting the shell; see
+    # the tauraro repo's `build-termux-android` CI job for the full reasoning
+    # (named for its original motivating case, but not Termux-specific in what
+    # it actually produces -- a static binary has no host-distro dependency at
+    # all).
+    if is_android():
+        return "android"
     mut s = shell_capture("uname -s")
     if s.contains("Darwin"):
         return "macos"

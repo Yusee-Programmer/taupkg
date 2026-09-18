@@ -5,3 +5,8 @@ build/
 
 **/tauraro_rt.h
 **/tauraro_types.h
+
+# Manual pre-overwrite safety backups of a deployed binary (e.g.
+# taupkg.exe.bak-20260908) -- not *.exe-suffixed so the rule above doesn't
+# already catch them, and never meant to be committed.
+*.bak-*

@@ -170,6 +170,110 @@ jobs:
           path: taupkg-${{ matrix.platform }}.sha256
 
   # -----------------------------------------------------------------
+  # Termux / Android build: taupkg statically linked so it runs under
+  # Termux's non-standard filesystem layout (everything under
+  # /data/data/com.termux/files/usr). Plain `taupkg-linux-arm64` above
+  # is architecture-correct (aarch64) but dynamically linked against
+  # Ubuntu's own glibc/ld.so path (ELF PT_INTERP) — that path doesn't
+  # exist under Termux, so it fails to load there even though the CPU
+  # matches. Same root cause tauraro's own `build-termux-android` job
+  # (tauraro/tauraro) exists to fix, but taupkg needs its own fix since
+  # it's a separately-shipped binary.
+  #
+  # No special bootstrap compiler is needed: the *compiler* only runs
+  # here on the ubuntu-22.04-arm CI runner (a normal Ubuntu box), so the
+  # regular dynamically-linked `tauraroc-linux-arm64` release works fine
+  # as the bootstrap. Only the *output* `taupkg` binary — the one that
+  # actually ships to a Termux device — needs `--static`, exactly like
+  # the existing windows-* case above.
+  # -----------------------------------------------------------------
+  build-termux-android:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout taupkg
+        uses: actions/checkout@v4
+
+      - name: Download latest tauraroc (linux-arm64 bootstrap)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ZIP="tauraroc-linux-arm64.zip"
+
+          TAG=$(gh release view \
+                  --repo tauraro/tauraro \
+                  --json tagName \
+                  -q '.tagName' 2>/dev/null || true)
+
+          if [ -z "$TAG" ]; then
+            echo "error: could not determine latest tauraroc release tag"
+            exit 1
+          fi
+          echo "Latest tauraroc: $TAG"
+
+          mkdir -p tauraroc-dl/
+          gh release download "$TAG" \
+            --repo tauraro/tauraro \
+            --pattern "$ZIP" \
+            --dir tauraroc-dl/ \
+            --clobber
+
+          mkdir -p tauraroc-install/
+          unzip -oq "tauraroc-dl/$ZIP" -d tauraroc-install/
+
+          BIN=$(find tauraroc-install -name "tauraroc" ! -path "*/src/*" | head -1)
+          if [ -z "$BIN" ]; then
+            echo "error: tauraroc not found in $ZIP"
+            exit 1
+          fi
+          chmod +x "$BIN"
+
+          BIN_DIR=$(dirname "$BIN")
+          echo "TAURAROC=$(pwd)/$BIN"                  >> "$GITHUB_ENV"
+          echo "TAURAROC_RT=$(pwd)/$BIN_DIR/runtime"    >> "$GITHUB_ENV"
+          echo "Using tauraroc: $(pwd)/$BIN"
+
+      - name: Build taupkg (statically linked, for Termux)
+        shell: bash
+        run: |
+          "$TAURAROC" src/main.tr -o taupkg --static
+          echo "Built: taupkg --static"
+
+      - name: Verify the binary is actually static (no dynamic-linker dependency)
+        shell: bash
+        run: |
+          set -e
+          file taupkg
+          if ldd taupkg 2>&1 | grep -q "=>"; then
+            echo "FAIL: taupkg is dynamically linked (found resolved .so dependencies)"
+            ldd taupkg
+            exit 1
+          fi
+          echo "OK: no dynamic dependencies — safe to run under Termux's own filesystem layout"
+          ./taupkg version
+
+      - name: Generate SHA256 checksum
+        shell: bash
+        run: |
+          sha256sum taupkg > taupkg-android-arm64.sha256
+          cat taupkg-android-arm64.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taupkg-android-arm64
+          path: |
+            taupkg
+            taupkg-android-arm64.sha256
+
+      - name: Upload SHA256 checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taupkg-android-arm64-sha256
+          if-no-files-found: error
+          path: taupkg-android-arm64.sha256
+
+  # -----------------------------------------------------------------
   # Release: runs only on v* tag pushes after all builds succeed.
   # Downloads each platform binary, zips it, creates a GitHub Release.
   # -----------------------------------------------------------------

@@ -3,7 +3,7 @@
 
 from std.io import File, Dir
 from std.os import OS, Process, Env
-from cli import parse_args, print_usage, CliArgs
+from cliargs import parse_args, print_usage, CliArgs
 from manifest import Manifest
 from lockfile import Lockfile, LockedPkg
 from semver import Version
@@ -11,6 +11,7 @@ from source import parse_source
 from installer import install_package
 from resolver import resolve, Resolution, ResolvedDep
 from builder import build_project, run_binary, find_compiler, tauraro_path_value, apply_tauraro_path
+from buildscript import run_build_scripts
 from registry import registry_search
 from util import path_join, mkdir_p, shell_capture, project_pkg_dir, project_build_dir, rm_rf, credentials_path, taupkg_home, hash_tree, shell_quote, shell_run, path_resolve
 from security import generate_sbom, load_advisories, audit_advisories
@@ -340,6 +341,12 @@ def cmd_build(args: CliArgs, manifest: Manifest, lockfile: Lockfile, project_roo
     if not has_lock and eff_lock.packages.len > 0:
         eff_lock.save(path_join(project_root, "taupkg.lock"))
 
+    # Run each resolved package's build script (Cargo build.rs equivalent) --
+    # e.g. fetching/compiling a vendored C dependency -- before tauraroc ever
+    # runs, so its auto-link pragma has whatever it needs already in place.
+    if not run_build_scripts(project_root, manifest, eff_lock, verbose):
+        return 1
+
     mut ok = build_project(project_root, manifest, eff_lock, output, release, target, sandbox, verbose)
     if ok:
         print("Build succeeded.")
@@ -411,6 +418,8 @@ def cmd_test(manifest: Manifest, lockfile: Lockfile, project_root: str, verbose:
 
     # Tests import the project's deps too — set TAURARO_PATH automatically.
     apply_tauraro_path(project_root, lockfile, verbose)
+    if not run_build_scripts(project_root, manifest, lockfile, verbose):
+        return 1
 
     # Collect every `.tr` test file. A file passes iff it compiles, runs with
     # exit code 0, and its output does not contain "FAILED".

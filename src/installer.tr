@@ -16,6 +16,7 @@ from manifest import Manifest
 from lockfile import LockedPkg
 from semver import Version
 from crypto.hash import Hash
+from progress import download_with_progress
 
 # Install a single package into the project's packages directory.
 # Returns a LockedPkg describing what was installed, or an empty LockedPkg on failure.
@@ -80,10 +81,11 @@ pub def install_package(
             tmp_file = tmp_file + ".tgz"
         else:
             tmp_file = tmp_file + ".tar.gz"
-        if verbose:
-            print("  [archive] downloading " + src.uri)
-        mut dl_cmd = "curl -fsSL -o \"" + tmp_file + "\" \"" + src.uri + "\""
-        mut rc = Process.system(dl_cmd)
+        # Same resumable, progress-bar download install-tauraro uses: `tmp_file`
+        # is a stable path per (project, pkg_name), so an interrupted `add`/
+        # `install` (dropped connection, Ctrl+C) picks up from where it left
+        # off on the next run instead of re-downloading the whole archive.
+        mut rc = download_with_progress(src.uri, tmp_file, pkg_name)
         if rc != 0:
             print("error: failed to download " + src.uri)
             return LockedPkg.init("", "", "", "")

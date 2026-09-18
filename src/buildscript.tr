@@ -1,0 +1,173 @@
+# Build scripts -- taupkg's answer to Cargo's build.rs, for packages that
+# wrap a native C/C++ dependency (fetch source, compile it, tell tauraroc how
+# to link it) instead of a pure-Tauraro one.
+#
+# Design, in one paragraph: a package opts in with `[package] build =
+# "build.tr"` in ITS OWN taupkg.toml. Before the top-level `taupkg build`
+# compiles anything, taupkg compiles and runs that script once per resolved
+# package (cwd = the package's own directory, a stable per-package
+# TAUPKG_OUT_DIR for its downloaded/compiled artifacts), with a cache so a
+# script only re-runs when its own source or the package's lock checksum
+# changes. The script's job is to leave its OWN package in a state
+# tauraroc's existing auto-link pragma mechanism already understands --
+# typically by writing/patching a `# tauraro-cpp-linkflags:` (or
+# `-shim:`) line into one of its own `.tr` modules once it knows the
+# absolute paths on this machine (see any vendored-C package's raw.tr for
+# the pragma format). taupkg does NOT invent a second linking mechanism or
+# change how tauraroc builds the final link line -- it only guarantees the
+# script ran before compilation starts.
+#
+# `[package] links = "<name>"` is the other half, straight from Cargo: at
+# most one package in the whole resolved graph may declare a given `links`
+# value, because two vendored static copies of the same native library
+# would define the same C symbols twice at final link time. Checked once,
+# up front, across the whole graph -- see check_links_conflicts.
+
+from std.io import File
+from std.os import OS, Env
+from crypto.hash import Hash
+from util import path_join, mkdir_p, shell_quote, shell_run, taupkg_home, project_pkg_dir
+from manifest import Manifest
+from lockfile import Lockfile
+from builder import find_compiler
+
+# Where a package's build script may read/write its own downloaded/compiled
+# artifacts: ~/.taupkg/native/<pkgname>-<checksum-prefix>/ -- content-addressed
+# by the package's OWN lock checksum (not just its name/version), so a source
+# change always gets a fresh directory instead of silently reusing stale
+# artifacts, while identical resolved packages across different projects on
+# the same machine share one build (Cargo's target/ dir, per-crate, does the
+# same content-addressing trick via its fingerprint).
+pub def native_out_dir(pkg_name: str, checksum: str) -> str:
+    mut short = checksum
+    if short.starts_with("sha256:"): short = short.slice(7, short.len())
+    if short.len() > 16: short = short.slice(0, 16)
+    return path_join(path_join(taupkg_home(), "native"), pkg_name + "-" + short)
+
+
+# Cargo's `links` rule: at most one package in the resolved graph may declare
+# a given `links` value. `pkg_dirs` maps package name -> its installed
+# directory. Returns "" if there's no conflict, else a human-readable error
+# naming both offending packages.
+pub def check_links_conflicts(pkg_dirs: Map[str, str]) -> str:
+    mut seen: Map[str, str] = Map[str, str].init(8)   # links value -> owning package name
+    for name in pkg_dirs.keys():
+        mut dir = pkg_dirs.get(name)
+        mut manifest_path = path_join(dir, "taupkg.toml")
+        if not File.file_exists(manifest_path): continue
+        mut mf = Manifest.load(manifest_path)
+        if mf.links.len() == 0: continue
+        if seen.contains(mf.links):
+            mut other = seen.get(mf.links)
+            mut msg = "packages '" + name + "' and '" + other + "' both declare links = \"" + mf.links + "\" -- only one package in the dependency graph may link a given native library (two vendored static copies would define the same C symbols twice). Depend on just one of them, or have one wrap the other instead of both vendoring it independently."
+            return msg
+        seen.insert(mf.links, name)
+    return ""
+
+
+# Compiles and runs `pkg_dir`'s build script (a no-op, returning true, if its
+# taupkg.toml declares none). Cached by a hash of the script's own source +
+# the package's lock checksum -- re-run only when either changes.
+pub def run_build_script(pkg_name: str, pkg_dir: str, checksum: str, verbose: bool) -> bool:
+    mut manifest_path = path_join(pkg_dir, "taupkg.toml")
+    if not File.file_exists(manifest_path): return true
+    mut mf = Manifest.load(manifest_path)
+    if mf.build.len() == 0: return true
+
+    mut script_path = path_join(pkg_dir, mf.build)
+    if not File.file_exists(script_path):
+        print("error: " + pkg_name + " declares build = \"" + mf.build + "\" but that file doesn't exist")
+        return false
+
+    mut out_dir = native_out_dir(pkg_name, checksum)
+    mkdir_p(out_dir)
+
+    # The "already ran" marker lives INSIDE pkg_dir (not out_dir, which is a
+    # stable global cache keyed by checksum) so it is wiped along with
+    # everything else if `taupkg install` ever detects drift and reinstalls
+    # pkg_dir from pristine source (e.g. because this very script patched one
+    # of pkg_dir's own tracked files) -- otherwise a stale marker would
+    # survive that reinstall and wrongly skip re-patching on the next build,
+    # even though pkg_dir's file no longer has the patch. The (expensive)
+    # actual build artifacts this script produces still live in the stable
+    # global out_dir and are unaffected either way -- a good build script
+    # checks for its own prior output there before redoing expensive work.
+    mut cache_key = Hash.sha256(File.read_text(script_path))
+    mut cache_file = path_join(pkg_dir, ".taupkg_build_cache")
+    if File.file_exists(cache_file) and File.read_text(cache_file).trim() == cache_key:
+        if verbose:
+            print("  " + pkg_name + ": build script cached, skipping (" + out_dir + ")")
+        return true
+
+    print("Running build script for " + pkg_name + "...")
+    mut cc = find_compiler()
+    mut exe = path_join(out_dir, "_build_script")
+    if OS.is_windows(): exe = exe + ".exe"
+    mut compile_cmd = shell_quote(cc) + " " + shell_quote(script_path) + " -o " + shell_quote(exe)
+    if verbose: print("  " + compile_cmd)
+    if shell_run(compile_cmd) != 0:
+        print("error: failed to compile build script for " + pkg_name)
+        return false
+
+    # A small, Cargo-`build.rs`-env-var-flavored contract the script can rely on.
+    Env.set_var("TAUPKG_OUT_DIR", out_dir)
+    Env.set_var("TAUPKG_PKG_NAME", pkg_name)
+    Env.set_var("TAUPKG_PKG_DIR", pkg_dir)
+
+    # Scope cwd to the package directory via a shell `cd &&` prefix rather than
+    # OS.chdir() (process-global -- would leak into every later command run by
+    # this taupkg invocation, and collides with mingw's own libc chdir() in
+    # codegen besides).
+    mut run_cmd = ""
+    if OS.is_windows():
+        run_cmd = "cd /d " + shell_quote(pkg_dir) + " && " + shell_quote(exe)
+    else:
+        run_cmd = "cd " + shell_quote(pkg_dir) + " && " + shell_quote(exe)
+    if verbose: print("  " + run_cmd)
+    mut rc = shell_run(run_cmd)
+    if rc != 0:
+        print("error: build script for " + pkg_name + " failed (exit code " + str(rc) + ")")
+        return false
+
+    File.write_text(cache_file, cache_key)
+    return true
+
+
+# Runs every resolved package's build script, PLUS the root project's own
+# (if it declares one) -- matching Cargo, which runs a crate's build.rs both
+# when it's a dependency AND when you `cargo build` that crate directly.
+# MVP ordering is lock order for dependencies, root last; a build script must
+# not assume any OTHER package's build script has already run.
+pub def run_build_scripts(project_root: str, root_manifest: Manifest, lockfile: Lockfile, verbose: bool) -> bool:
+    mut pkg_dirs: Map[str, str] = Map[str, str].init(8)
+    mut i = 0
+    while i < lockfile.packages.len:
+        mut p = lockfile.packages.get(i)
+        i = i + 1
+        pkg_dirs.insert(p.name, path_join(project_pkg_dir(project_root), p.name))
+    # The root project links-conflict-checks and build-scripts too, if it
+    # declares its own `build`/`links` (e.g. developing/testing a vendored-C
+    # package directly rather than as someone else's dependency).
+    pkg_dirs.insert(root_manifest.name, project_root)
+
+    mut conflict = check_links_conflicts(pkg_dirs)
+    if conflict.len() > 0:
+        print("error: " + conflict)
+        return false
+
+    mut j = 0
+    while j < lockfile.packages.len:
+        mut p = lockfile.packages.get(j)
+        j = j + 1
+        mut dir = pkg_dirs.get(p.name)
+        if not run_build_script(p.name, dir, p.checksum, verbose):
+            return false
+
+    # NOT hash_tree(project_root): the root project's OWN build script commonly
+    # writes into its own tree (a patched raw.tr pragma, fetched libs under
+    # headers/lib/, ...), which would make a full-tree hash change on every
+    # run and permanently defeat the cache. The package's version is a stable
+    # identifier a human bumps deliberately, matching how a dependency's own
+    # cache key (its LOCKED checksum, fixed at install time) doesn't move
+    # just because ITS build script wrote output either.
+    return run_build_script(root_manifest.name, project_root, root_manifest.version, verbose)
